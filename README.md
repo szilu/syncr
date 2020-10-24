@@ -35,18 +35,19 @@ Current state, TODO
 * [x] Directory analyzing
     * [ ] Metadata and chunk cache to speed up scanning
 * [x] Chunking
-* Diff algorithms
+* [ ] Diff algorithms
     * [x] Latest file
     * [ ] State cache, with interactive conflict resolution
 * [x] Locally available chunk resolution
 * [x] Chunk transfer
 * [x] File write
 * [ ] Directory structure creation
-* Metadata
+* [ ] Metadata
     * [x] File mode (permissions)
     * [ ] Ownership
     * [ ] ...
 * [x] n-way sync support
 * [ ] Remote directory support (SSH)
+* [ ] Error handling
 
 As you can see, my first goal was to make the concept work. And it seems to work pretty well. But some basic things are still missing (for example directory creation is very essential).
