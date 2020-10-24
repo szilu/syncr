@@ -32,21 +32,21 @@ Basic usage
 
 Current state, TODO
 -------------------
-* [&#10004;] Directory analyzing
+* [x] Directory analyzing
     * [ ] Metadata and chunk cache to speed up scanning
-* [&#10004;] Chunking
+* [x] Chunking
 * Diff algorithms
-    * [&#10004;] Latest file
+    * [x] Latest file
     * [ ] State cache, with interactive conflict resolution
-* [&#10004;] Locally available chunk resolution
-* [&#10004;] Chunk transfer
-* [&#10004;] File write
+* [x] Locally available chunk resolution
+* [x] Chunk transfer
+* [x] File write
 * [ ] Directory structure creation
 * Metadata
-    * [&#10004;] File mode (permissions)
+    * [x] File mode (permissions)
     * [ ] Ownership
     * [ ] ...
-* [&#10004;] n-way sync support
+* [x] n-way sync support
 * [ ] Remote directory support (SSH)
 
 As you can see, my first goal was to make the concept work. And it seems to work pretty well. But some basic things are still missing (for example directory creation is very essential).
