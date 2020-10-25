@@ -47,22 +47,32 @@ The architecture makes it possible to implement other useful filesystem tools on
 
 Current state, TODO
 -------------------
+Priorities: H: High, M: Medium, L: Low
+
 * [x] Directory analyzing
-    * [ ] Metadata and chunk cache to speed up scanning
+    * [ ] Metadata and chunk cache to speed up scanning (M)
 * [x] Chunking
 * [ ] Diff algorithms
     * [x] Latest file
-    * [ ] State cache, with interactive conflict resolution
+    * [ ] State cache, with interactive conflict resolution (H)
 * [x] Locally available chunk resolution
 * [x] Chunk transfer
 * [x] File write
-* [ ] Directory structure creation
+* [ ] Directory structure creation (H)
 * [ ] Metadata
     * [x] File mode (permissions)
-    * [ ] Ownership
+    * [ ] Ownership (L)
     * [ ] ...
 * [x] n-way sync support
-* [ ] Remote directory support (SSH)
-* [ ] Error handling
+* [x] Remote directory support (SSH)
+* [ ] Error handling (H)
+* [ ] Configuration
+    * [ ] Include / exclude lists (H)
+    * [ ] Selecting diff algorithm (H)
+    * [ ] Run in batch mode (M)
+    * [ ] Verbose / Silent / Progress / Debug (L)
+    * [ ] Metadata masks / overrides (permissions, user/group) (L)
+    * [ ] Store archive metadata on master host / master + all hosts (L)
+    * [ ] Remote shell command (L)
 
 As you can see, my first goal was to make the concept work. And it seems to work pretty well. But some basic things are still missing (for example directory creation is very essential).

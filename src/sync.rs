@@ -7,6 +7,7 @@ use std::error::Error;
 use std::{path, pin::Pin};
 
 use crate::types::{HashChunk, FileData};
+use crate::connect;
 
 //////////
 // Sync //
@@ -107,16 +108,6 @@ impl NodeState {
             }
         }
 
-        /*
-        self.send.get_mut().write_all(b"QUIT\n").await?;
-        loop {
-            buf.clear();
-            let n = self.recv.get_mut().read_line(&mut buf).await?;
-            if n == 0 || buf.trim() == "." { break; }
-            println!("QUIT: {}", buf.trim());
-        }
-        */
-
         Ok(())
     }
 }
@@ -126,11 +117,11 @@ struct SyncState {
 }
 
 impl SyncState {
-    fn add_node(&mut self, child: &mut async_process::Child) {
+    fn add_node(&mut self, send: async_process::ChildStdin, recv: async_std::io::BufReader<async_process::ChildStdout>) {
         let node = Box::new(NodeState {
             id: self.nodes.len() as u8 + 1,
-            recv: RefCell::new(aio::BufReader::new(child.stdout.take().expect("Failed to spawn subprocess"))),
-            send: RefCell::new(child.stdin.take().expect("Failed to spawn subprocess")),
+            send: RefCell::new(send),
+            recv: RefCell::new(recv),
             dir: BTreeMap::new(),
             chunks: BTreeSet::new(),
             missing: RefCell::new(BTreeSet::new())
@@ -140,18 +131,12 @@ impl SyncState {
 }
 
 pub async fn sync(dirs: Vec<&str>) -> Result<(), Box<dyn Error>> {
-    //let mut state = SyncState { nodes: vec![NodeState { dir: BTreeMap::new() }, NodeState { dir: BTreeMap::new() }] };
     let mut state = SyncState { nodes: Vec::new() };
 
     eprintln!("Initializing processes...");
     for dir in dirs {
-        let mut child = async_process::Command::new("syncr").arg("serve").arg(dir)
-            .stdin(async_process::Stdio::piped())
-            .stdout(async_process::Stdio::piped())
-            .spawn()
-            .expect("Failed to spawn subprocess");
-
-        state.add_node(&mut child);
+        let mut conn = connect::connect(dir).await?;
+        state.add_node(conn.send, conn.recv);
     }
 
     eprintln!("Collecting...");

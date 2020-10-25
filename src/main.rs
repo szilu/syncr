@@ -4,10 +4,11 @@ use std::{env, path};
 use std::error::Error;
 
 mod config;
-mod types;
-mod util;
+mod connect;
 mod serve;
 mod sync;
+mod types;
+mod util;
 
 ///////////////////////
 // Utility functions //
