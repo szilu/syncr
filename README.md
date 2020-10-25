@@ -33,11 +33,11 @@ on the search compilation put the binary (target/release/syncr) to your hosts (i
 
 Basic usage
 -----------
-    syncr sync ./dir1 ./dir2 [...]
+    syncr sync ./dir1 ./dir2 remote1:dir remote2.example.com:dir [...]
 
 Why
 ---
-I have been using [Unison](https://www.cis.upenn.edu/~bcpierce/unison/) for synchronizing files for years. However, I have always hated it's compatibility issues. It's not enough that Unison can't communicate between different versions of itself, but there can be issues with the same version, if they are not compiled with the same [OcaML](https://ocaml.org/) version.
+I have been using [Unison](https://www.cis.upenn.edu/~bcpierce/unison/) for synchronizing files for years. However, I have always hated it's compatibility issues. It's not enough that Unison can't communicate between different versions of itself, but there can be issues with the same version, if they are not compiled with the same [OCaml](https://ocaml.org/) version.
 
 This makes it practically unusable if you want to synchronize between several hosts.
 
