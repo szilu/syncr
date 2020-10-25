@@ -16,11 +16,11 @@ SyncR is (or will be) an awesome file system synchronization tool for UNIX OS-es
 
 Some if it's planned features:
 * Lightweight, single binary distribution (a statically linked < 1.5MB [MUSL](https://musl.libc.org/) binary can be compiled)
-* Content determined chunking with data deduplication (not just in single files, but in the whole directory structure)
-* Syncing over SSH connection
+* Content determined chunking with data deduplication (not just in single files, but in the whole directory structure, so it handles renames efficiently)
+* Syncing over SSH connection (it supports multiple remote directories)
 * Multi-destination sync: SyncR supports n-way syncing of directories (where in theory n > 100)
 
-The fun thing:
+The coolest thing:
 It is possible to run SyncR on a workstation and run n-way synchronization on several servers without a local instance of the synchronized directory.
 
 Installation
@@ -29,7 +29,7 @@ Installation
     cd syncr
     cargo build --release
 
-After compilation copy the binary (target/release/syncr) to your hosts (it must be in PATH to work!).
+on the search compilation put the binary (target/release/syncr) to your hosts (it must be on the search PATH to work!).
 
 Basic usage
 -----------
@@ -37,13 +37,13 @@ Basic usage
 
 Why
 ---
-I have been using [Unison](https://www.cis.upenn.edu/~bcpierce/unison/) for synchronizing files for years. However, I always hated it's compatibility issues. It's not enough that Unison can't communicate between different versions of itself, but there can be issues with the same version, if they are not compiled with the same [OcaML](https://ocaml.org/) version.
+I have been using [Unison](https://www.cis.upenn.edu/~bcpierce/unison/) for synchronizing files for years. However, I have always hated it's compatibility issues. It's not enough that Unison can't communicate between different versions of itself, but there can be issues with the same version, if they are not compiled with the same [OcaML](https://ocaml.org/) version.
 
-It makes it practically unusable if you want to synchronize between several hosts.
+This makes it practically unusable if you want to synchronize between several hosts.
 
 I have looked for other solutions, but I couldn't find a lightweight one, so I decided it will be a good project to learn [Rust](https://www.rust-lang.org/).
 
-The architecture makes it possible to implement other useful filesystem tools on top of it. One example can be a deduplicating backup utility.
+The architecture and the remote protocol makes it possible to implement other useful filesystem tools on top of it. One example can be a deduplicating backup utility.
 
 Current state, TODO
 -------------------
@@ -75,4 +75,4 @@ Priorities: H: High, M: Medium, L: Low
     * [ ] Store archive metadata on master host / master + all hosts (L)
     * [ ] Remote shell command (L)
 
-As you can see, my first goal was to make the concept work. And it seems to work pretty well. But some basic things are still missing (for example directory creation is very essential).
+As you can see, my first goal was to make the concept work. And it seems to work pretty well. But some basic things are still missing (for example directory creation and proper error handling is very essential).
