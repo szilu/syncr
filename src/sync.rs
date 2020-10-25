@@ -1,5 +1,5 @@
 use async_process;
-use async_std::{prelude::*, io as aio};
+use async_std::{prelude::*};
 use futures::future;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -135,7 +135,7 @@ pub async fn sync(dirs: Vec<&str>) -> Result<(), Box<dyn Error>> {
 
     eprintln!("Initializing processes...");
     for dir in dirs {
-        let mut conn = connect::connect(dir).await?;
+        let conn = connect::connect(dir).await?;
         state.add_node(conn.send, conn.recv);
     }
 

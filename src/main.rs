@@ -1,5 +1,5 @@
 use async_std::{task};
-use clap::{Arg, App, SubCommand};
+use clap::{Arg, App, AppSettings, SubCommand};
 use std::{env, path};
 use std::error::Error;
 
@@ -15,8 +15,9 @@ mod util;
 ///////////////////////
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let matches = App::new("SyncR").version("0.1").author("Szilard Hajba <szilard@symbion.hu>")
+    let matches = App::new("SyncR").version("0.1.0").author("Szilard Hajba <szilard@symbion.hu>")
         .about("2-way directory sync utility")
+        .setting(AppSettings::SubcommandRequiredElseHelp)
         .arg(Arg::with_name("profile")
             .short("p").long("profile").takes_value(true).help("Profile"))
         .subcommand(SubCommand::with_name("serve")

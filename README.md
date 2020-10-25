@@ -21,7 +21,7 @@ Some if it's planned features:
 * Multi-destination sync: SyncR supports n-way syncing of directories (where in theory n > 100)
 
 The fun thing:
-It will be possible to run SyncR on a workstation and run n-way synchronization on several servers without a local instance of the synchronized directory.
+It is possible to run SyncR on a workstation and run n-way synchronization on several servers without a local instance of the synchronized directory.
 
 Installation
 ------------

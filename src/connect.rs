@@ -1,5 +1,5 @@
 use async_process;
-use async_std::{prelude::*, io as aio};
+use async_std::{io as aio};
 use std::error::Error;
 
 pub struct Connect {
