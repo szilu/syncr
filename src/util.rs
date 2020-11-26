@@ -8,3 +8,15 @@ pub fn hash(buf: &[u8]) -> String {
     hasher.finish();
     return hasher.to_hex();
 }
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    #[test]
+    fn test_hash() {
+        let src: [u8;2 ] = ['1' as u8, '2' as u8];
+        let res = hash(&src);
+        // echo -n 12 | sha1sum
+        assert_eq!(res, "7b52009b64fd0a2a49e6d8a939753077792b0554");
+    }
+}
