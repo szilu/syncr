@@ -7,7 +7,7 @@ use crate::types::Config;
 mod config;
 mod connect;
 mod serve;
-mod sync;
+mod sync_impl; // Private sync implementation
 mod types;
 mod util;
 
@@ -99,7 +99,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 			.ok_or("sync: at least one directory argument required")?
 			.map(|s| s.as_str())
 			.collect();
-		let _ = sync::sync(config, dirs).await;
+		let _ = sync_impl::sync(config, dirs).await;
 	}
 
 	Ok(())

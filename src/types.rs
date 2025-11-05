@@ -1,12 +1,112 @@
+//! Core data types for SyncR
+
 use serde::ser::{Serialize, SerializeStruct, Serializer};
 use serde::{Deserialize, Serialize as SerdeSerialize};
 use std::collections::BTreeMap;
 use std::path;
+use std::time::Duration;
 
+/// Configuration (kept for backward compatibility with existing code)
 #[derive(Debug)]
 pub struct Config {
 	pub syncr_dir: path::PathBuf,
 	pub profile: String,
+}
+
+/// Sync operation phases
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum SyncPhase {
+	/// Initializing sync session
+	Initializing,
+
+	/// Collecting file metadata from nodes
+	Collecting,
+
+	/// Detecting conflicts
+	DetectingConflicts,
+
+	/// Resolving conflicts
+	ResolvingConflicts,
+
+	/// Transferring file/directory metadata
+	TransferringMetadata,
+
+	/// Transferring file chunks
+	TransferringChunks,
+
+	/// Committing changes
+	Committing,
+
+	/// Sync complete
+	Complete,
+}
+
+impl std::fmt::Display for SyncPhase {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			SyncPhase::Initializing => write!(f, "Initializing"),
+			SyncPhase::Collecting => write!(f, "Collecting"),
+			SyncPhase::DetectingConflicts => write!(f, "Detecting conflicts"),
+			SyncPhase::ResolvingConflicts => write!(f, "Resolving conflicts"),
+			SyncPhase::TransferringMetadata => write!(f, "Transferring metadata"),
+			SyncPhase::TransferringChunks => write!(f, "Transferring chunks"),
+			SyncPhase::Committing => write!(f, "Committing"),
+			SyncPhase::Complete => write!(f, "Complete"),
+		}
+	}
+}
+
+/// Result of a sync operation
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct SyncResult {
+	/// Number of files successfully synced
+	pub files_synced: usize,
+
+	/// Number of directories created
+	pub dirs_created: usize,
+
+	/// Number of files deleted
+	pub files_deleted: usize,
+
+	/// Total bytes transferred
+	pub bytes_transferred: u64,
+
+	/// Number of chunks transferred
+	pub chunks_transferred: usize,
+
+	/// Number of chunks deduplicated (already present)
+	pub chunks_deduplicated: usize,
+
+	/// Number of conflicts encountered
+	pub conflicts_encountered: usize,
+
+	/// Number of conflicts resolved
+	pub conflicts_resolved: usize,
+
+	/// Duration of sync operation
+	pub duration: Duration,
+
+	/// Any non-fatal errors encountered
+	pub errors: Vec<String>,
+}
+
+impl Default for SyncResult {
+	fn default() -> Self {
+		SyncResult {
+			files_synced: 0,
+			dirs_created: 0,
+			files_deleted: 0,
+			bytes_transferred: 0,
+			chunks_transferred: 0,
+			chunks_deduplicated: 0,
+			conflicts_encountered: 0,
+			conflicts_resolved: 0,
+			duration: Duration::ZERO,
+			errors: vec![],
+		}
+	}
 }
 
 #[derive(Clone, Debug)]
