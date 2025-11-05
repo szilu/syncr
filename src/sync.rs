@@ -105,6 +105,21 @@ impl SyncBuilder {
 		self
 	}
 
+	/// Get the number of locations configured
+	pub fn location_count(&self) -> usize {
+		self.locations.len()
+	}
+
+	/// Get a reference to the locations
+	pub fn locations(&self) -> &[String] {
+		&self.locations
+	}
+
+	/// Get a reference to the sync configuration
+	pub fn config(&self) -> &SyncConfig {
+		&self.config
+	}
+
 	/// Execute the sync operation
 	pub async fn sync(self) -> Result<SyncResult, SyncError> {
 		if self.locations.is_empty() {
