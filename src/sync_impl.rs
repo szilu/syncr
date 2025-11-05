@@ -1,5 +1,6 @@
 use futures::future;
 use std::collections::{BTreeMap, BTreeSet};
+use std::env;
 use std::error::Error;
 use std::io::{self, Read};
 use std::{path, pin::Pin};
@@ -59,6 +60,41 @@ impl Drop for FileLock {
 	}
 }
 
+/// Parse a trace message from child process
+/// Format: #<LEVEL>:<message> or !<LEVEL>:<message>
+/// Returns: (level_char, message_string)
+fn parse_trace_message(line: &str) -> Option<(char, String)> {
+	if line.len() < 3 {
+		return None;
+	}
+
+	let prefix = line.chars().next()?;
+	if prefix != '#' && prefix != '!' {
+		return None;
+	}
+
+	let level = line.chars().nth(1)?;
+	let message = if line.len() > 3 && line.chars().nth(2) == Some(':') {
+		line[3..].to_string()
+	} else {
+		String::new()
+	};
+
+	Some((level, message))
+}
+
+/// Log a trace message from child with node context
+fn log_trace_message(level: char, message: &str, node_id: u8) {
+	match level {
+		'I' => info!("[node {}] {}", node_id, message),
+		'W' => warn!("[node {}] {}", node_id, message),
+		'D' => debug!("[node {}] {}", node_id, message),
+		'T' => trace!("[node {}] {}", node_id, message),
+		'E' => error!("[node {}] {}", node_id, message),
+		_ => {}
+	}
+}
+
 /// Perform protocol version handshake with a remote node
 /// Parent sends VERSION:<version>, child responds with VERSION:<version>
 async fn handshake(
@@ -72,8 +108,10 @@ async fn handshake(
 		return Err("Expected ready signal from server".into());
 	}
 
-	// Send our protocol version
-	send.write_all(format!("VERSION:{}\n", PROTOCOL_VERSION).as_bytes()).await?;
+	// Send our protocol version with log level
+	let log_level = env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
+	send.write_all(format!("VERSION:{}:{}\n", PROTOCOL_VERSION, log_level).as_bytes())
+		.await?;
 	send.flush().await?;
 
 	// Read remote protocol version
@@ -237,6 +275,13 @@ impl NodeState {
 			if buf.trim() == "." {
 				break;
 			}
+
+			// Check for trace messages from child (format: #<LEVEL>:<msg> or !<LEVEL>:<msg>)
+			if let Some((level, message)) = parse_trace_message(buf.trim()) {
+				log_trace_message(level, &message, self.id);
+				continue; // Skip protocol parsing for trace messages
+			}
+
 			//println!("[{}]LINE: {}", self.id, buf.trim());
 
 			let fields = protocol_utils::parse_protocol_line(&buf, 1)?;
@@ -544,7 +589,7 @@ pub async fn sync(config: Config, dirs: Vec<&str>) -> Result<(), Box<dyn Error>>
 	let json = serde_json::to_string(&tree)
 		.map_err(|e| format!("Failed to serialize state to JSON: {}", e))?;
 	debug!("JSON: {}", json);
-	let fname = config.syncr_dir.clone().join("test.profile.json");
+	let fname = config.syncr_dir.clone().join(format!("{}.profile.json", config.profile));
 	let mut f = afs::File::create(&fname).await?;
 	f.write_all(json.as_bytes()).await?;
 
@@ -554,11 +599,28 @@ pub async fn sync(config: Config, dirs: Vec<&str>) -> Result<(), Box<dyn Error>>
 		node.send("WRITE").await?;
 	}
 
-	for (path, to_do) in diff {
+	// Sort paths so parent directories are created before children
+	// This ensures that directory structure is created correctly
+	let mut diff_vec: Vec<_> = diff.into_iter().collect();
+	diff_vec.sort_by_key(|(path, _)| {
+		// Sort by depth (number of separators) first, then by path
+		let depth = path.components().count();
+		(depth, path.to_path_buf())
+	});
+
+	for (path, to_do) in diff_vec {
 		if let SyncOption::Some(todo) = to_do {
 			let files: Vec<Option<&Box<FileData>>> =
 				state.nodes.iter().map(|n| n.dir.get(path)).collect();
-			let lfile = &files[todo as usize].unwrap();
+
+			// Validate that todo index is within bounds and has a file
+			let lfile = match files.get(todo as usize).and_then(|f| f.as_ref()) {
+				Some(f) => f,
+				None => {
+					error!("Error: winner node {} does not have file for {}", todo, path.display());
+					continue;
+				}
+			};
 
 			for (idx, file) in files.iter().enumerate() {
 				if idx != todo as usize {
@@ -619,7 +681,14 @@ pub async fn sync(config: Config, dirs: Vec<&str>) -> Result<(), Box<dyn Error>>
 		loop {
 			buf.clear();
 			srcnode.recv.lock().await.read_line(&mut buf).await?;
-			if chunk.is_empty() && &buf[..2] == "C:" {
+
+			// Skip trace messages from child
+			if let Some((level, message)) = parse_trace_message(buf.trim()) {
+				log_trace_message(level, &message, srcnode.id);
+				continue;
+			}
+
+			if chunk.is_empty() && buf.len() > 2 && &buf[..2] == "C:" {
 				chunk.clear();
 				chunk.push_str(&buf.trim()[2..]);
 				chunkdata.clear();
@@ -658,14 +727,26 @@ pub async fn sync(config: Config, dirs: Vec<&str>) -> Result<(), Box<dyn Error>>
 		node.send("COMMIT").await?;
 		// Wait for response and check for errors
 		let mut buf = String::new();
-		node.recv.lock().await.read_line(&mut buf).await?;
-		let response = buf.trim();
-		if response.starts_with("ERROR:") {
-			return Err(format!("Node {} failed to commit: {}", node.id, response).into());
-		} else if response != "OK" {
-			return Err(
-				format!("Node {} returned unexpected response: {}", node.id, response).into()
-			);
+		loop {
+			buf.clear();
+			node.recv.lock().await.read_line(&mut buf).await?;
+
+			// Skip trace messages from child
+			if let Some((level, message)) = parse_trace_message(buf.trim()) {
+				log_trace_message(level, &message, node.id);
+				continue;
+			}
+
+			let response = buf.trim();
+			if response.starts_with("ERROR:") {
+				return Err(format!("Node {} failed to commit: {}", node.id, response).into());
+			} else if response == "OK" {
+				break;
+			} else {
+				return Err(
+					format!("Node {} returned unexpected response: {}", node.id, response).into()
+				);
+			}
 		}
 	}
 
@@ -679,7 +760,12 @@ pub async fn sync(config: Config, dirs: Vec<&str>) -> Result<(), Box<dyn Error>>
 			if n == 0 || buf.trim() == "." {
 				break;
 			}
-			//eprintln!("QUIT: {}", buf.trim());
+
+			// Skip trace messages from child
+			if let Some((level, message)) = parse_trace_message(buf.trim()) {
+				log_trace_message(level, &message, node.id);
+				continue;
+			}
 		}
 	}
 

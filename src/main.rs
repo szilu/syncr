@@ -49,9 +49,6 @@ fn init_syncr_dir() -> Result<path::PathBuf, Box<dyn Error>> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-	// Initialize tracing subscriber
-	logging::init_tracing();
-
 	let matches = Command::new("SyncR")
 		.version("0.1.0")
 		.author("Szilard Hajba <szilard@symbion.hu>")
@@ -82,9 +79,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
 		.get_matches();
 
 	if let Some(matches) = matches.subcommand_matches("serve") {
+		// Serve mode: use protocol propagation for logs
+		logging::init_protocol_propagation();
 		let dir = matches.get_one::<String>("dir").ok_or("serve: directory argument required")?;
 		return serve::serve(dir);
 	} else if let Some(matches) = matches.subcommand_matches("dump") {
+		// Dump mode: use standard tracing for stderr output
+		logging::init_tracing();
 		let dir = matches.get_one::<String>("dir").ok_or("dump: directory argument required")?;
 		env::set_current_dir(dir)?;
 		let dump_state = serve::serve_list(path::PathBuf::from("."))?;
@@ -93,6 +94,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
 			info!("{}: {:?}", h, p);
 		}
 	} else if let Some(sub_matches) = matches.subcommand_matches("sync") {
+		// Sync mode: use standard tracing for stderr output
+		logging::init_tracing();
 		let config = Config {
 			syncr_dir: init_syncr_dir()?,
 			profile: matches
