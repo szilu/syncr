@@ -5,7 +5,7 @@ use sha::sha1::Sha1 as Sha;
 pub fn hash(buf: &[u8]) -> String {
     let mut hasher = Sha::default();
     hasher.digest(buf);
-    hasher.finish();
+    let _ = hasher.finish();
     return hasher.to_hex();
 }
 

@@ -1,5 +1,5 @@
 use async_std::{prelude::*, task, fs as afs};
-use base64;
+use base64::{Engine as _, engine::general_purpose};
 use glob;
 use rollsum::Bup;
 use std::cell::RefCell;
@@ -12,7 +12,7 @@ use std::os::unix::{fs::MetadataExt, prelude::PermissionsExt};
 
 use crate::config;
 use crate::util;
-use crate::types::{FileChunk, HashChunk, FileData};
+use crate::types::{FileChunk, HashChunk, FileType, FileData};
 
 ///////////
 // Utils //
@@ -36,7 +36,7 @@ pub struct DumpState {
 }
 
 impl DumpState {
-    fn add_chunk(self: &mut DumpState, hash: String, path: path::PathBuf, offset: u64, size: usize) {
+    fn add_chunk(&mut self, hash: String, path: path::PathBuf, offset: u64, size: usize) {
         let v = self.chunks.entry(hash).or_insert(Vec::new());
         if v.iter().position(|p| &p.path == &path).is_none() {
             v.push(Box::new(FileChunk {path, offset, size}));
@@ -79,10 +79,10 @@ Box::pin(async move {
             continue;
         }
 
-		let meta = fs::metadata(&path)?;
+		let meta = fs::symlink_metadata(&path)?;
 
 		if meta.is_file() {
-            println!("F:{}:{}:{}:{}:{}:{}", &path.to_str().unwrap(), meta.mode(), meta.uid(), meta.gid(), meta.size(), meta.mtime());
+            println!("F:{}:{}:{}:{}:{}:{}:{}", &path.to_str().unwrap(), meta.mode(), meta.uid(), meta.gid(), meta.ctime(), meta.mtime(), meta.size());
 
             let mut f = afs::File::open(&path).await?;
             let mut buf: Vec<u8> = vec![0; config::MAX_CHUNK_SIZE];
@@ -97,7 +97,7 @@ Box::pin(async move {
                 if endofs > n {
                     endofs = n
                 }
-                if let Some(count) = bup.find_chunk_edge(&buf[..endofs]) {
+                if let Some((count, _hash)) = bup.find_chunk_edge(&buf[..endofs]) {
                     let h = util::hash(&buf[..count]);
                     println!("C:{}:{}:{}", offset, count, &h);
                     //state.chunks.insert(h, path.clone());
@@ -120,8 +120,12 @@ Box::pin(async move {
 
             }
 		}
+        if meta.file_type().is_symlink() {
+            println!("L:{}:{}:{}:{}:{}:{}", &path.to_str().unwrap(), meta.mode(), meta.uid(), meta.gid(), meta.ctime(), meta.mtime());
+        }
         if meta.is_dir() {
-            println!("D:{}:{}:{}", path.to_str().unwrap(), meta.uid(), meta.gid());
+            println!("D:{}:{}:{}:{}:{}:{}", &path.to_str().unwrap(), meta.mode(), meta.uid(), meta.gid(), meta.ctime(), meta.mtime());
+            //println!("D:{}:{}:{}", path.to_str().unwrap(), meta.uid(), meta.gid());
             traverse_dir(&mut state, path).await?
         }
 	}
@@ -163,7 +167,7 @@ async fn serve_read(dir: path::PathBuf, dump_state: &DumpState) -> Result<(), Bo
                 let mut buf: Vec<u8> = vec![0; fc.size];
                 f.seek(io::SeekFrom::Start(fc.offset)).await?;
                 f.read(&mut buf).await?;
-                let encoded = base64::encode(buf);
+                let encoded = general_purpose::STANDARD.encode(buf);
                 println!("C:{}", chunk);
                 for line in encoded.into_bytes().chunks(config::BASE64_LINE_LENGTH) {
                     io::stdout().write_all(line)?;
@@ -193,12 +197,14 @@ async fn serve_write(dir: path::PathBuf, dump_state: &DumpState) -> Result<(), B
             "FM" | "FD" => {
                 let path = path::PathBuf::from(fields[1]);
                 let fd = Box::new(FileData {
+                    tp: FileType::File,
                     path: path.clone(),
                     mode: fields[2].parse().expect("Child parse error"),
                     user: fields[3].parse().expect("Child parse error"),
                     group: fields[4].parse().expect("Child parse error"),
-                    size: fields[5].parse().expect("Child parse error"),
+                    ctime: fields[5].parse().expect("Child parse error"),
                     mtime: fields[6].parse().expect("Child parse error"),
+                    size: fields[7].parse().expect("Child parse error"),
                     chunks: vec![]
                 });
                 if fields[0] == "FD" {
@@ -211,6 +217,29 @@ async fn serve_write(dir: path::PathBuf, dump_state: &DumpState) -> Result<(), B
                     afs::set_permissions(&filepath, afs::Permissions::from_mode(fd.mode)).await?;
                     dump_state.rename.borrow_mut().insert(filepath.clone(), path.clone());
                 }
+            },
+            "D" => {
+                let path = path::PathBuf::from(fields[1]);
+                let fd = Box::new(FileData {
+                    tp: FileType::Dir,
+                    path: path.clone(),
+                    mode: fields[2].parse().expect("Child parse error"),
+                    user: fields[3].parse().expect("Child parse error"),
+                    group: fields[4].parse().expect("Child parse error"),
+                    ctime: fields[5].parse().expect("Child parse error"),
+                    mtime: fields[6].parse().expect("Child parse error"),
+                    size: 0,
+                    chunks: vec![]
+                });
+                filepath = path.clone();
+                let filename = path.file_name().expect("Protocol error!").to_os_string();
+                // FIXME: Should create temp dir, but then all paths must be altered!
+                //filename.push(".SyNcR-TmP");
+                filepath.set_file_name(filename);
+                eprintln!("MKDIR {:?}", &filepath);
+                afs::create_dir(&filepath).await?;
+                afs::set_permissions(&filepath, afs::Permissions::from_mode(fd.mode)).await?;
+                dump_state.rename.borrow_mut().insert(filepath.clone(), path.clone());
             },
             "LC" | "RC" => {
                 if file.is_none() {
@@ -249,7 +278,7 @@ async fn serve_write(dir: path::PathBuf, dump_state: &DumpState) -> Result<(), B
                         break;
                     }
                     //eprintln!("DECODE: [{:?}]", &buf.trim());
-                    chunk.append(&mut base64::decode(&buf.trim())?);
+                    chunk.append(&mut general_purpose::STANDARD.decode(&buf.trim())?);
                 }
                 //eprintln!("DECODED CHUNK: {:?}", chunk);
                 let mut missing = dump_state.missing.borrow_mut();
@@ -285,7 +314,7 @@ async fn serve_write(dir: path::PathBuf, dump_state: &DumpState) -> Result<(), B
     Ok(())
 }
 
-async fn serve_commit(_FIXME_dir: path::PathBuf, dump_state: &DumpState) -> Result<(), Box<dyn Error>> {
+async fn serve_commit(_fixme_dir: path::PathBuf, dump_state: &DumpState) -> Result<(), Box<dyn Error>> {
     if dump_state.missing.borrow().len() > 0 {
         eprintln!("FIXME: ERROR");
     }
