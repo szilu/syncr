@@ -21,6 +21,10 @@ serde_json = "1.0"
 sha = "1.0"
 termios = "0.3"
 
+[dev-dependencies]
+tempfile = "3.8"
+# rollsum is already in main dependencies, just documenting it's used in tests too
+
 [profile.release]
 opt-level = 3
 debug = 0
