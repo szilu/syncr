@@ -36,6 +36,16 @@ pub struct DumpState {
 }
 
 impl DumpState {
+    // Helper to safely parse protocol fields with validation
+    fn parse_protocol_line<'a>(buf: &'a str, expected_fields: usize) -> Result<Vec<&'a str>, Box<dyn Error>> {
+        let fields: Vec<&str> = buf.trim().split(':').collect();
+        if fields.len() < expected_fields {
+            return Err(format!("Protocol error: expected {} fields, got {} in line: {}",
+                             expected_fields, fields.len(), buf.trim()).into());
+        }
+        Ok(fields)
+    }
+
     fn add_chunk(&mut self, hash: String, path: path::PathBuf, offset: u64, size: usize) {
         let v = self.chunks.entry(hash).or_insert(Vec::new());
         if v.iter().position(|p| &p.path == &path).is_none() {
@@ -54,8 +64,13 @@ impl DumpState {
                 let mut buf: Vec<u8> = vec![0; fc.size];
                 f.seek(io::SeekFrom::Start(fc.offset)).await?;
                 f.read(&mut buf).await?;
-                // FIXME: Hash check, error handling
-                //eprintln!("Hash check: {} ?= {}", util::hash(&buf), hash);
+
+                // Verify hash to detect corruption
+                let computed_hash = util::hash(&buf);
+                if computed_hash != hash {
+                    return Err(format!("Hash mismatch for chunk {}: expected {}, got {}", hash, hash, computed_hash).into());
+                }
+
                 Ok(Some(buf))
             },
             None => Ok(None)
@@ -63,6 +78,12 @@ impl DumpState {
     }
 
     async fn write_chunk(&self, path: &path::Path, chunk: &HashChunk, buf: &Vec<u8>) -> Result<(), Box<dyn Error>> {
+        // Verify hash before writing to detect corruption during transfer
+        let computed_hash = util::hash(buf);
+        if computed_hash != chunk.hash {
+            return Err(format!("Hash mismatch for chunk {}: expected {}, got {}", chunk.hash, chunk.hash, computed_hash).into());
+        }
+
         let mut f = afs::OpenOptions::new().write(true).create(true).open(&path).await?;
         f.seek(io::SeekFrom::Start(chunk.offset)).await?;
         f.write_all(&buf).await?;
@@ -190,28 +211,40 @@ async fn serve_write(dir: path::PathBuf, dump_state: &DumpState) -> Result<(), B
     let mut filepath = path::PathBuf::from("");
     loop {
         buf.clear();
-        io::stdin().read_line(&mut buf).expect("Failed to read");
-        let fields: Vec<&str> = buf.trim().split(':').collect();
+        io::stdin().read_line(&mut buf)?;
 
-        match fields[0] {
+        let fields = DumpState::parse_protocol_line(&buf, 1)?;
+        let cmd = fields[0];
+
+        match cmd {
             "FM" | "FD" => {
+                let fields = DumpState::parse_protocol_line(&buf, 8)?;
                 let path = path::PathBuf::from(fields[1]);
                 let fd = Box::new(FileData {
                     tp: FileType::File,
                     path: path.clone(),
-                    mode: fields[2].parse().expect("Child parse error"),
-                    user: fields[3].parse().expect("Child parse error"),
-                    group: fields[4].parse().expect("Child parse error"),
-                    ctime: fields[5].parse().expect("Child parse error"),
-                    mtime: fields[6].parse().expect("Child parse error"),
-                    size: fields[7].parse().expect("Child parse error"),
+                    mode: fields[2].parse()
+                        .map_err(|e| format!("Invalid mode '{}': {}", fields[2], e))?,
+                    user: fields[3].parse()
+                        .map_err(|e| format!("Invalid user '{}': {}", fields[3], e))?,
+                    group: fields[4].parse()
+                        .map_err(|e| format!("Invalid group '{}': {}", fields[4], e))?,
+                    ctime: fields[5].parse()
+                        .map_err(|e| format!("Invalid ctime '{}': {}", fields[5], e))?,
+                    mtime: fields[6].parse()
+                        .map_err(|e| format!("Invalid mtime '{}': {}", fields[6], e))?,
+                    size: fields[7].parse()
+                        .map_err(|e| format!("Invalid size '{}': {}", fields[7], e))?,
                     chunks: vec![]
                 });
-                if fields[0] == "FD" {
+                if cmd == "FD" {
                     filepath = path.clone();
-                    let mut filename = path.file_name().expect("Protocol error!").to_os_string();
-                    filename.push(".SyNcR-TmP");
-                    filepath.set_file_name(filename);
+                    let filename = path.file_name()
+                        .ok_or("Path has no filename")?
+                        .to_os_string();
+                    let mut tmp_filename = filename;
+                    tmp_filename.push(".SyNcR-TmP");
+                    filepath.set_file_name(tmp_filename);
                     //eprintln!("CREATE {:?}", &filepath);
                     file = Some(afs::File::create(&filepath).await?);
                     afs::set_permissions(&filepath, afs::Permissions::from_mode(fd.mode)).await?;
@@ -219,20 +252,27 @@ async fn serve_write(dir: path::PathBuf, dump_state: &DumpState) -> Result<(), B
                 }
             },
             "D" => {
+                let fields = DumpState::parse_protocol_line(&buf, 7)?;
                 let path = path::PathBuf::from(fields[1]);
                 let fd = Box::new(FileData {
                     tp: FileType::Dir,
                     path: path.clone(),
-                    mode: fields[2].parse().expect("Child parse error"),
-                    user: fields[3].parse().expect("Child parse error"),
-                    group: fields[4].parse().expect("Child parse error"),
-                    ctime: fields[5].parse().expect("Child parse error"),
-                    mtime: fields[6].parse().expect("Child parse error"),
+                    mode: fields[2].parse()
+                        .map_err(|e| format!("Invalid mode '{}': {}", fields[2], e))?,
+                    user: fields[3].parse()
+                        .map_err(|e| format!("Invalid user '{}': {}", fields[3], e))?,
+                    group: fields[4].parse()
+                        .map_err(|e| format!("Invalid group '{}': {}", fields[4], e))?,
+                    ctime: fields[5].parse()
+                        .map_err(|e| format!("Invalid ctime '{}': {}", fields[5], e))?,
+                    mtime: fields[6].parse()
+                        .map_err(|e| format!("Invalid mtime '{}': {}", fields[6], e))?,
                     size: 0,
                     chunks: vec![]
                 });
                 filepath = path.clone();
-                let filename = path.file_name().expect("Protocol error!").to_os_string();
+                let filename = path.file_name()
+                    .ok_or("Path has no filename")?;
                 // FIXME: Should create temp dir, but then all paths must be altered!
                 //filename.push(".SyNcR-TmP");
                 filepath.set_file_name(filename);
@@ -242,17 +282,21 @@ async fn serve_write(dir: path::PathBuf, dump_state: &DumpState) -> Result<(), B
                 dump_state.rename.borrow_mut().insert(filepath.clone(), path.clone());
             },
             "LC" | "RC" => {
+                let fields = DumpState::parse_protocol_line(&buf, 4)?;
                 if file.is_none() {
-                    panic!("Protocol error!");
+                    return Err("Protocol error: chunk command without file".into());
                 }
                 let hc = Box::new(HashChunk {
                     hash: String::from(fields[3]),
-                    offset: fields[1].parse().expect("Child parse error"),
-                    size: fields[2].parse().expect("Child parse error")
+                    offset: fields[1].parse()
+                        .map_err(|e| format!("Invalid offset '{}': {}", fields[1], e))?,
+                    size: fields[2].parse()
+                        .map_err(|e| format!("Invalid size '{}': {}", fields[2], e))?,
                 });
-                if fields[0] == "LC" {
+                if cmd == "LC" {
                     // Local chunk, copy it locally
-                    let buf = dump_state.read_chunk(&dir, fields[3]).await?.expect("Chunk not found");
+                    let buf = dump_state.read_chunk(&dir, fields[3]).await?
+                        .ok_or_else(|| format!("Chunk not found: {}", fields[3]))?;
                     if let Err(e) = dump_state.write_chunk(&filepath, &hc, &buf).await {
                         println!("ERROR {}", e);
                     }
@@ -262,18 +306,21 @@ async fn serve_write(dir: path::PathBuf, dump_state: &DumpState) -> Result<(), B
                     let v = missing.entry(String::from(fields[3])).or_insert(Vec::new());
                     v.push(Box::new(FileChunk {
                         path: filepath.clone(),
-                        offset: fields[1].parse().expect("Child parse error"),
-                        size: fields[2].parse().expect("Child parse error")
+                        offset: fields[1].parse()
+                            .map_err(|e| format!("Invalid offset '{}': {}", fields[1], e))?,
+                        size: fields[2].parse()
+                            .map_err(|e| format!("Invalid size '{}': {}", fields[2], e))?,
                     }));
                 }
             },
             "C" => {
+                let fields = DumpState::parse_protocol_line(&buf, 2)?;
                 let mut buf = String::new();
                 let hash = fields[1];
                 let mut chunk: Vec<u8> = Vec::new();
                 loop {
                     buf.clear();
-                    io::stdin().read_line(&mut buf).expect("Failed to read");
+                    io::stdin().read_line(&mut buf)?;
                     if buf.trim() == "." {
                         break;
                     }
@@ -307,7 +354,7 @@ async fn serve_write(dir: path::PathBuf, dump_state: &DumpState) -> Result<(), B
                     break;
                 }
             }
-            _ => panic!("Child parse error: {}", buf.trim())
+            _ => return Err(format!("Unknown command: {}", cmd).into())
         }
     }
     println!("OK");
@@ -315,9 +362,18 @@ async fn serve_write(dir: path::PathBuf, dump_state: &DumpState) -> Result<(), B
 }
 
 async fn serve_commit(_fixme_dir: path::PathBuf, dump_state: &DumpState) -> Result<(), Box<dyn Error>> {
-    if dump_state.missing.borrow().len() > 0 {
-        eprintln!("FIXME: ERROR");
+    let missing = dump_state.missing.borrow();
+    if missing.len() > 0 {
+        let missing_hashes: Vec<&String> = missing.keys().collect();
+        eprintln!("ERROR: Cannot commit - {} missing chunks", missing.len());
+        for hash in &missing_hashes {
+            eprintln!("  Missing chunk: {}", hash);
+        }
+        println!("ERROR:Cannot commit with {} missing chunks", missing.len());
+        return Err(format!("Cannot commit: {} chunks still missing", missing.len()).into());
     }
+    drop(missing); // Release the borrow before rename operations
+
     for (src, dst) in dump_state.rename.borrow().iter() {
         //eprintln!("RENAME: {:?} -> {:?}", src, dst);
         afs::rename(&src, &dst).await?;

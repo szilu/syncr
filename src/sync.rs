@@ -15,6 +15,31 @@ use crate::connect;
 //////////
 // Sync //
 //////////
+
+// RAII guard to restore terminal settings on drop (prevents broken terminal on panic)
+struct TerminalGuard {
+    fd: i32,
+    original: Termios,
+}
+
+impl TerminalGuard {
+    fn new() -> Result<Self, Box<dyn Error>> {
+        let fd = 0; // stdin
+        let original = Termios::from_fd(fd)?;
+        let mut new_termios = original.clone();
+        new_termios.c_lflag &= !(ICANON | ECHO);
+        tcsetattr(fd, TCSANOW, &new_termios)?;
+        Ok(TerminalGuard { fd, original })
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        // Restore terminal even if panic occurs
+        let _ = tcsetattr(self.fd, TCSANOW, &self.original);
+    }
+}
+
 struct NodeState {
     id: u8,
     send: RefCell<async_process::ChildStdin>,
@@ -31,6 +56,16 @@ impl PartialEq for NodeState {
 }
 
 impl NodeState {
+    // Helper to safely parse protocol fields with validation
+    fn parse_protocol_line<'a>(buf: &'a str, expected_fields: usize) -> Result<Vec<&'a str>, Box<dyn Error>> {
+        let fields: Vec<&str> = buf.trim().split(':').collect();
+        if fields.len() < expected_fields {
+            return Err(format!("Protocol error: expected {} fields, got {} in line: {}",
+                             expected_fields, fields.len(), buf.trim()).into());
+        }
+        Ok(fields)
+    }
+
     async fn write_file(&self, file: &FileData, trans_data: bool) -> Result<(), Box<dyn Error>> {
         match file.tp {
             FileType::File => {
@@ -83,77 +118,94 @@ impl NodeState {
             self.recv.get_mut().read_line(&mut buf).await?;
             if buf.trim() == "." { break; }
             //println!("[{}]LINE: {}", self.id, buf.trim());
-            let fields: Vec<&str> = buf.trim().split(':').collect();
 
-            match fields[0] {
+            let fields = Self::parse_protocol_line(&buf, 1)?;
+            let cmd = fields[0];
+
+            match cmd {
                 "F" => {
+                    let fields = Self::parse_protocol_line(&buf, 8)?;
                     let path = path::PathBuf::from(fields[1]);
                     let fd = Box::new(FileData {
                         tp: FileType::File,
                         path: path.clone(),
-                        mode: fields[2].parse().expect("Child parse error"),
-                        user: fields[3].parse().expect("Child parse error"),
-                        group: fields[4].parse().expect("Child parse error"),
-                        ctime: fields[5].parse().expect("Child parse error"),
-                        mtime: fields[6].parse().expect("Child parse error"),
-                        size: fields[7].parse().expect("Child parse error"),
+                        mode: fields[2].parse()
+                            .map_err(|e| format!("Invalid mode '{}': {}", fields[2], e))?,
+                        user: fields[3].parse()
+                            .map_err(|e| format!("Invalid user '{}': {}", fields[3], e))?,
+                        group: fields[4].parse()
+                            .map_err(|e| format!("Invalid group '{}': {}", fields[4], e))?,
+                        ctime: fields[5].parse()
+                            .map_err(|e| format!("Invalid ctime '{}': {}", fields[5], e))?,
+                        mtime: fields[6].parse()
+                            .map_err(|e| format!("Invalid mtime '{}': {}", fields[6], e))?,
+                        size: fields[7].parse()
+                            .map_err(|e| format!("Invalid size '{}': {}", fields[7], e))?,
                         chunks: vec![]
                     });
-                    //file_data = &fd;
                     self.dir.insert(fd.path.clone(), fd);
                     file_data = self.dir.get_mut(&path);
-                    //self.dir.insert(path.clone(), file_data);
                 },
                 "C" => {
+                    let fields = Self::parse_protocol_line(&buf, 4)?;
                     let hc = Box::new(HashChunk {
                         hash: String::from(fields[3]),
-                        offset: fields[1].parse().expect("Child parse error"),
-                        size: fields[2].parse().expect("Child parse error")
+                        offset: fields[1].parse()
+                            .map_err(|e| format!("Invalid offset '{}': {}", fields[1], e))?,
+                        size: fields[2].parse()
+                            .map_err(|e| format!("Invalid size '{}': {}", fields[2], e))?,
                     });
                     match &mut file_data {
                         Some(data) => { data.chunks.push(hc); },
-                        None => { panic!("FIXME"); }
+                        None => { return Err("Protocol error: chunk without file".into()); }
                     }
                     self.chunks.insert(String::from(fields[3]));
-                    //file_data.chunks.push(hc);
                 },
                 "L" => {
+                    let fields = Self::parse_protocol_line(&buf, 7)?;
                     let path = path::PathBuf::from(fields[1]);
                     let fd = Box::new(FileData {
                         tp: FileType::SymLink,
                         path: path.clone(),
-                        mode: fields[2].parse().expect("Child parse error"),
-                        user: fields[3].parse().expect("Child parse error"),
-                        group: fields[4].parse().expect("Child parse error"),
-                        ctime: fields[5].parse().expect("Child parse error"),
-                        mtime: fields[6].parse().expect("Child parse error"),
+                        mode: fields[2].parse()
+                            .map_err(|e| format!("Invalid mode '{}': {}", fields[2], e))?,
+                        user: fields[3].parse()
+                            .map_err(|e| format!("Invalid user '{}': {}", fields[3], e))?,
+                        group: fields[4].parse()
+                            .map_err(|e| format!("Invalid group '{}': {}", fields[4], e))?,
+                        ctime: fields[5].parse()
+                            .map_err(|e| format!("Invalid ctime '{}': {}", fields[5], e))?,
+                        mtime: fields[6].parse()
+                            .map_err(|e| format!("Invalid mtime '{}': {}", fields[6], e))?,
                         size: 0,
                         chunks: vec![]
                     });
-                    //file_data = &fd;
                     self.dir.insert(fd.path.clone(), fd);
                     file_data = self.dir.get_mut(&path);
-                    //self.dir.insert(path.clone(), file_data);
                 },
                 "D" => {
+                    let fields = Self::parse_protocol_line(&buf, 7)?;
                     let path = path::PathBuf::from(fields[1]);
                     let fd = Box::new(FileData {
                         tp: FileType::Dir,
                         path: path.clone(),
-                        mode: fields[2].parse().expect("Child parse error"),
-                        user: fields[3].parse().expect("Child parse error"),
-                        group: fields[4].parse().expect("Child parse error"),
-                        ctime: fields[5].parse().expect("Child parse error"),
-                        mtime: fields[6].parse().expect("Child parse error"),
+                        mode: fields[2].parse()
+                            .map_err(|e| format!("Invalid mode '{}': {}", fields[2], e))?,
+                        user: fields[3].parse()
+                            .map_err(|e| format!("Invalid user '{}': {}", fields[3], e))?,
+                        group: fields[4].parse()
+                            .map_err(|e| format!("Invalid group '{}': {}", fields[4], e))?,
+                        ctime: fields[5].parse()
+                            .map_err(|e| format!("Invalid ctime '{}': {}", fields[5], e))?,
+                        mtime: fields[6].parse()
+                            .map_err(|e| format!("Invalid mtime '{}': {}", fields[6], e))?,
                         size: 0,
                         chunks: vec![]
                     });
-                    //file_data = &fd;
                     self.dir.insert(fd.path.clone(), fd);
                     file_data = self.dir.get_mut(&path);
-                    //self.dir.insert(path.clone(), file_data);
                 },
-                _ => panic!("Child parse error: {}", buf.trim())
+                _ => return Err(format!("Unknown command in protocol: {}", cmd).into())
             }
         }
 
@@ -223,12 +275,8 @@ pub async fn sync(config: Config, dirs: Vec<&str>) -> Result<(), Box<dyn Error>>
     // Do diffing
     eprintln!("Running diff...");
 
-    // Configure terminal for key input
-    let stdin = 0;
-    let termios = Termios::from_fd(stdin).unwrap();
-    let mut new_termios = termios.clone();
-    new_termios.c_lflag &= !(ICANON | ECHO);
-    tcsetattr(stdin, TCSANOW, &mut new_termios).unwrap();
+    // Configure terminal for key input (RAII guard ensures cleanup on panic)
+    let _terminal_guard = TerminalGuard::new()?;
 
     let mut diff: BTreeMap<&path::Path, SyncOption<u8>> = BTreeMap::new();
     for node in &state.nodes {
@@ -326,8 +374,7 @@ pub async fn sync(config: Config, dirs: Vec<&str>) -> Result<(), Box<dyn Error>>
     }
     //println!("DIFF: {:?}", diff);
 
-    // Reset terminal
-    tcsetattr(stdin, TCSANOW, & termios).unwrap();
+    // Terminal will be automatically restored by TerminalGuard when it goes out of scope
 
     /*
     let mut json: String = "".to_owned();
@@ -441,6 +488,15 @@ pub async fn sync(config: Config, dirs: Vec<&str>) -> Result<(), Box<dyn Error>>
     eprintln!("Commiting changes...");
     for node in &state.nodes {
         node.send("COMMIT").await?;
+        // Wait for response and check for errors
+        let mut buf = String::new();
+        node.recv.borrow_mut().read_line(&mut buf).await?;
+        let response = buf.trim();
+        if response.starts_with("ERROR:") {
+            return Err(format!("Node {} failed to commit: {}", node.id, response).into());
+        } else if response != "OK" {
+            return Err(format!("Node {} returned unexpected response: {}", node.id, response).into());
+        }
     }
 
     // Quit children
