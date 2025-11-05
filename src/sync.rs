@@ -1,11 +1,12 @@
-use async_std::sync::Mutex;
-use async_std::{fs as afs, prelude::*};
 use futures::future;
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::io::{self, Read};
 use std::{path, pin::Pin};
 use termios::{tcsetattr, Termios, ECHO, ICANON, TCSANOW};
+use tokio::fs as afs;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::Mutex;
 
 use crate::connect;
 use crate::types::{Config, FileData, FileType, HashChunk, PreviousSyncState};
@@ -56,8 +57,8 @@ impl Drop for FileLock {
 /// Perform protocol version handshake with a remote node
 /// Parent sends VERSION:<version>, child responds with VERSION:<version>
 async fn handshake(
-	send: &mut async_process::ChildStdin,
-	recv: &mut async_std::io::BufReader<async_process::ChildStdout>,
+	send: &mut tokio::process::ChildStdin,
+	recv: &mut BufReader<tokio::process::ChildStdout>,
 ) -> Result<(), Box<dyn Error>> {
 	// Read server's ready signal (.)
 	let mut buf = String::new();
@@ -123,8 +124,8 @@ impl Drop for TerminalGuard {
 
 struct NodeState {
 	id: u8,
-	send: Mutex<async_process::ChildStdin>,
-	recv: Mutex<async_std::io::BufReader<async_process::ChildStdout>>,
+	send: Mutex<tokio::process::ChildStdin>,
+	recv: Mutex<BufReader<tokio::process::ChildStdout>>,
 	dir: BTreeMap<path::PathBuf, Box<FileData>>,
 	chunks: BTreeSet<String>,
 	missing: Mutex<BTreeSet<String>>,
@@ -156,8 +157,7 @@ impl NodeState {
 		match file.tp {
 			FileType::File => {
 				if trans_data {
-					writeln!(
-						self.send.lock().await,
+					let msg = format!(
 						"FD:{}:{}:{}:{}:{}:{}:{}",
 						file.path.to_string_lossy(),
 						file.mode,
@@ -166,36 +166,31 @@ impl NodeState {
 						file.ctime,
 						file.mtime,
 						file.size
-					)
-					.await?;
+					);
+					self.send.lock().await.write_all(format!("{}\n", msg).as_bytes()).await?;
 					for chunk in &file.chunks {
 						if !self.chunks.contains(&chunk.hash) {
 							// Chunk needs transfer
-							writeln!(
-								self.send.lock().await,
-								"RC:{}:{}:{}",
-								chunk.offset,
-								chunk.size,
-								chunk.hash
-							)
-							.await?;
+							let msg = format!("RC:{}:{}:{}", chunk.offset, chunk.size, chunk.hash);
+							self.send
+								.lock()
+								.await
+								.write_all(format!("{}\n", msg).as_bytes())
+								.await?;
 							self.missing.lock().await.insert(chunk.hash.clone());
 						} else {
 							// Chunk is available locally
-							writeln!(
-								self.send.lock().await,
-								"LC:{}:{}:{}",
-								chunk.offset,
-								chunk.size,
-								chunk.hash
-							)
-							.await?;
+							let msg = format!("LC:{}:{}:{}", chunk.offset, chunk.size, chunk.hash);
+							self.send
+								.lock()
+								.await
+								.write_all(format!("{}\n", msg).as_bytes())
+								.await?;
 						}
 					}
-					writeln!(self.send.lock().await, ".").await?;
+					self.send.lock().await.write_all(b".\n").await?;
 				} else {
-					writeln!(
-						self.send.lock().await,
+					let msg = format!(
 						"FM:{}:{}:{}:{}:{}:{}:{}",
 						file.path.to_string_lossy(),
 						file.mode,
@@ -204,13 +199,12 @@ impl NodeState {
 						file.ctime,
 						file.mtime,
 						file.size
-					)
-					.await?;
+					);
+					self.send.lock().await.write_all(format!("{}\n", msg).as_bytes()).await?;
 				}
 			}
 			FileType::SymLink => {
-				writeln!(
-					self.send.lock().await,
+				let msg = format!(
 					"L:{}:{}:{}:{}:{}:{}",
 					file.path.to_string_lossy(),
 					file.mode,
@@ -218,12 +212,11 @@ impl NodeState {
 					file.group,
 					file.ctime,
 					file.mtime
-				)
-				.await?;
+				);
+				self.send.lock().await.write_all(format!("{}\n", msg).as_bytes()).await?;
 			}
 			FileType::Dir => {
-				writeln!(
-					self.send.lock().await,
+				let msg = format!(
 					"D:{}:{}:{}:{}:{}:{}",
 					file.path.to_string_lossy(),
 					file.mode,
@@ -231,8 +224,8 @@ impl NodeState {
 					file.group,
 					file.ctime,
 					file.mtime
-				)
-				.await?;
+				);
+				self.send.lock().await.write_all(format!("{}\n", msg).as_bytes()).await?;
 			}
 		}
 		Ok(())
@@ -383,8 +376,8 @@ struct SyncState {
 impl SyncState {
 	fn add_node(
 		&mut self,
-		send: async_process::ChildStdin,
-		recv: async_std::io::BufReader<async_process::ChildStdout>,
+		send: tokio::process::ChildStdin,
+		recv: BufReader<tokio::process::ChildStdout>,
 	) {
 		let node = NodeState {
 			id: self.nodes.len() as u8 + 1,

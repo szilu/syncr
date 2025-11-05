@@ -1,4 +1,3 @@
-use async_std::task;
 use clap::{Arg, ArgAction, Command};
 use std::error::Error;
 use std::{env, fs, path};
@@ -43,7 +42,8 @@ fn init_syncr_dir() -> Result<path::PathBuf, Box<dyn Error>> {
 	}
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
 	let matches = Command::new("SyncR")
 		.version("0.1.0")
 		.author("Szilard Hajba <szilard@symbion.hu>")
@@ -99,7 +99,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 			.ok_or("sync: at least one directory argument required")?
 			.map(|s| s.as_str())
 			.collect();
-		let _ = task::block_on(sync::sync(config, dirs));
+		let _ = sync::sync(config, dirs).await;
 	}
 
 	Ok(())

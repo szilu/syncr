@@ -1,4 +1,3 @@
-use async_std::{fs as afs, prelude::*, task};
 use base64::{engine::general_purpose, Engine as _};
 use rollsum::Bup;
 use std::cell::RefCell;
@@ -7,6 +6,8 @@ use std::error::Error;
 use std::io::Write;
 use std::os::unix::{fs::MetadataExt, prelude::PermissionsExt};
 use std::{env, fs, io, path, pin::Pin};
+use tokio::fs as afs;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 //use std::{thread, time};
 
 use crate::config;
@@ -108,7 +109,7 @@ impl DumpState {
 				let mut f = afs::File::open(&path).await?;
 				let mut buf: Vec<u8> = vec![0; fc.size];
 				f.seek(io::SeekFrom::Start(fc.offset)).await?;
-				f.read(&mut buf).await?;
+				f.read_exact(&mut buf).await?;
 
 				// Verify hash to detect corruption
 				let computed_hash = util::hash(&buf);
@@ -142,7 +143,12 @@ impl DumpState {
 			.into());
 		}
 
-		let mut f = afs::OpenOptions::new().write(true).create(true).open(&path).await?;
+		let mut f = afs::OpenOptions::new()
+			.write(true)
+			.create(true)
+			.truncate(false)
+			.open(&path)
+			.await?;
 		f.seek(io::SeekFrom::Start(chunk.offset)).await?;
 		f.write_all(buf).await?;
 		Ok(())
@@ -243,7 +249,9 @@ pub fn serve_list(dir: path::PathBuf) -> Result<DumpState, Box<dyn Error>> {
 		missing: RefCell::new(BTreeMap::new()),
 		rename: RefCell::new(BTreeMap::new()),
 	};
-	task::block_on(traverse_dir(&mut state, dir))?;
+	tokio::task::block_in_place(|| {
+		tokio::runtime::Handle::current().block_on(traverse_dir(&mut state, dir))
+	})?;
 
 	println!(".");
 	Ok(state)
@@ -272,7 +280,7 @@ async fn serve_read(dir: path::PathBuf, dump_state: &DumpState) -> Result<(), Bo
 			let mut f = afs::File::open(&path).await?;
 			let mut buf: Vec<u8> = vec![0; fc.size];
 			f.seek(io::SeekFrom::Start(fc.offset)).await?;
-			f.read(&mut buf).await?;
+			f.read_exact(&mut buf).await?;
 			let encoded = general_purpose::STANDARD.encode(buf);
 			println!("C:{}", chunk);
 			for line in encoded.into_bytes().chunks(config::BASE64_LINE_LENGTH) {
@@ -356,7 +364,8 @@ async fn serve_write(dir: path::PathBuf, dump_state: &DumpState) -> Result<(), B
 					filepath.set_file_name(tmp_filename);
 					//eprintln!("CREATE {:?}", &filepath);
 					file = Some(afs::File::create(&filepath).await?);
-					afs::set_permissions(&filepath, afs::Permissions::from_mode(fd.mode)).await?;
+					afs::set_permissions(&filepath, std::fs::Permissions::from_mode(fd.mode))
+						.await?;
 					dump_state.rename.borrow_mut().insert(filepath.clone(), path.clone());
 				}
 			}
@@ -391,7 +400,7 @@ async fn serve_write(dir: path::PathBuf, dump_state: &DumpState) -> Result<(), B
 				filepath.set_file_name(filename);
 				eprintln!("MKDIR {:?}", &filepath);
 				afs::create_dir(&filepath).await?;
-				afs::set_permissions(&filepath, afs::Permissions::from_mode(fd.mode)).await?;
+				afs::set_permissions(&filepath, std::fs::Permissions::from_mode(fd.mode)).await?;
 				dump_state.rename.borrow_mut().insert(filepath.clone(), path.clone());
 			}
 			"LC" | "RC" => {
@@ -597,19 +606,34 @@ pub fn serve(dir: &str) -> Result<(), Box<dyn Error>> {
 			}
 			"LIST" => dump_state = Some(serve_list(path::PathBuf::from("."))?),
 			"READ" => match &dump_state {
-				Some(state) => task::block_on(serve_read(path::PathBuf::from("."), state))?,
+				Some(state) => {
+					tokio::task::block_in_place(|| {
+						tokio::runtime::Handle::current()
+							.block_on(serve_read(path::PathBuf::from("."), state))
+					})?;
+				}
 				None => {
 					println!("!Use LIST command first!");
 				}
 			},
 			"WRITE" => match &dump_state {
-				Some(state) => task::block_on(serve_write(path::PathBuf::from("."), state))?,
+				Some(state) => {
+					tokio::task::block_in_place(|| {
+						tokio::runtime::Handle::current()
+							.block_on(serve_write(path::PathBuf::from("."), state))
+					})?;
+				}
 				None => {
 					println!("!Use LIST command first!");
 				}
 			},
 			"COMMIT" => match &dump_state {
-				Some(state) => task::block_on(serve_commit(path::PathBuf::from("."), state))?,
+				Some(state) => {
+					tokio::task::block_in_place(|| {
+						tokio::runtime::Handle::current()
+							.block_on(serve_commit(path::PathBuf::from("."), state))
+					})?;
+				}
 				None => {
 					println!("!Use LIST command first!");
 				}
