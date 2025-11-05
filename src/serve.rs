@@ -11,8 +11,10 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 //use std::{thread, time};
 
 use crate::config;
+#[allow(unused_imports)]
+use crate::metadata_utils;
 use crate::protocol_utils;
-use crate::types::{FileChunk, FileData, FileType, HashChunk};
+use crate::types::{FileChunk, HashChunk};
 use crate::util;
 
 /// Protocol version for handshake and compatibility checking
@@ -313,35 +315,11 @@ async fn serve_write(dir: path::PathBuf, dump_state: &DumpState) -> Result<(), B
 				}
 			}
 			"FM" | "FD" => {
-				let fields = protocol_utils::parse_protocol_line(&buf, 8)?;
-				let path = path::PathBuf::from(fields[1]);
+				let fd = metadata_utils::parse_file_metadata(&buf)?;
+				let path = fd.path.clone();
 
 				// Validate path to prevent directory traversal attacks
 				validate_path(&path)?;
-
-				let fd = Box::new(FileData {
-					tp: FileType::File,
-					path: path.clone(),
-					mode: fields[2]
-						.parse()
-						.map_err(|e| format!("Invalid mode '{}': {}", fields[2], e))?,
-					user: fields[3]
-						.parse()
-						.map_err(|e| format!("Invalid user '{}': {}", fields[3], e))?,
-					group: fields[4]
-						.parse()
-						.map_err(|e| format!("Invalid group '{}': {}", fields[4], e))?,
-					ctime: fields[5]
-						.parse()
-						.map_err(|e| format!("Invalid ctime '{}': {}", fields[5], e))?,
-					mtime: fields[6]
-						.parse()
-						.map_err(|e| format!("Invalid mtime '{}': {}", fields[6], e))?,
-					size: fields[7]
-						.parse()
-						.map_err(|e| format!("Invalid size '{}': {}", fields[7], e))?,
-					chunks: vec![],
-				});
 				if cmd == "FD" {
 					filepath = path.clone();
 					let filename = path.file_name().ok_or("Path has no filename")?.to_os_string();
@@ -356,29 +334,8 @@ async fn serve_write(dir: path::PathBuf, dump_state: &DumpState) -> Result<(), B
 				}
 			}
 			"D" => {
-				let fields = protocol_utils::parse_protocol_line(&buf, 7)?;
-				let path = path::PathBuf::from(fields[1]);
-				let fd = Box::new(FileData {
-					tp: FileType::Dir,
-					path: path.clone(),
-					mode: fields[2]
-						.parse()
-						.map_err(|e| format!("Invalid mode '{}': {}", fields[2], e))?,
-					user: fields[3]
-						.parse()
-						.map_err(|e| format!("Invalid user '{}': {}", fields[3], e))?,
-					group: fields[4]
-						.parse()
-						.map_err(|e| format!("Invalid group '{}': {}", fields[4], e))?,
-					ctime: fields[5]
-						.parse()
-						.map_err(|e| format!("Invalid ctime '{}': {}", fields[5], e))?,
-					mtime: fields[6]
-						.parse()
-						.map_err(|e| format!("Invalid mtime '{}': {}", fields[6], e))?,
-					size: 0,
-					chunks: vec![],
-				});
+				let fd = metadata_utils::parse_dir_metadata(&buf)?;
+				let path = fd.path.clone();
 				filepath = path.clone();
 				let filename = path.file_name().ok_or("Path has no filename")?;
 				// FIXME: Should create temp dir, but then all paths must be altered!

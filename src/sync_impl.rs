@@ -10,8 +10,10 @@ use tokio::sync::Mutex;
 
 // Use the old connect module directly (not the new connection.rs library API)
 use crate::connect;
+#[allow(unused_imports)]
+use crate::metadata_utils;
 use crate::protocol_utils;
-use crate::types::{Config, FileData, FileType, HashChunk, PreviousSyncState};
+use crate::types::{Config, FileData, FileType, PreviousSyncState};
 
 //////////
 // Sync //
@@ -241,106 +243,32 @@ impl NodeState {
 
 			match cmd {
 				"F" => {
-					let fields = protocol_utils::parse_protocol_line(&buf, 8)?;
-					let path = path::PathBuf::from(fields[1]);
-					let fd = Box::new(FileData {
-						tp: FileType::File,
-						path: path.clone(),
-						mode: fields[2]
-							.parse()
-							.map_err(|e| format!("Invalid mode '{}': {}", fields[2], e))?,
-						user: fields[3]
-							.parse()
-							.map_err(|e| format!("Invalid user '{}': {}", fields[3], e))?,
-						group: fields[4]
-							.parse()
-							.map_err(|e| format!("Invalid group '{}': {}", fields[4], e))?,
-						ctime: fields[5]
-							.parse()
-							.map_err(|e| format!("Invalid ctime '{}': {}", fields[5], e))?,
-						mtime: fields[6]
-							.parse()
-							.map_err(|e| format!("Invalid mtime '{}': {}", fields[6], e))?,
-						size: fields[7]
-							.parse()
-							.map_err(|e| format!("Invalid size '{}': {}", fields[7], e))?,
-						chunks: vec![],
-					});
+					let fd = metadata_utils::parse_file_metadata(&buf)?;
+					let path = fd.path.clone();
 					self.dir.insert(fd.path.clone(), fd);
 					file_data = self.dir.get_mut(&path);
 				}
 				"C" => {
-					let fields = protocol_utils::parse_protocol_line(&buf, 4)?;
-					let hc = HashChunk {
-						hash: String::from(fields[3]),
-						offset: fields[1]
-							.parse()
-							.map_err(|e| format!("Invalid offset '{}': {}", fields[1], e))?,
-						size: fields[2]
-							.parse()
-							.map_err(|e| format!("Invalid size '{}': {}", fields[2], e))?,
-					};
+					let hc = metadata_utils::parse_chunk_metadata(&buf)?;
 					match &mut file_data {
 						Some(data) => {
-							data.chunks.push(hc);
+							data.chunks.push(hc.clone());
 						}
 						None => {
 							return Err("Protocol error: chunk without file".into());
 						}
 					}
-					self.chunks.insert(String::from(fields[3]));
+					self.chunks.insert(hc.hash);
 				}
 				"L" => {
-					let fields = protocol_utils::parse_protocol_line(&buf, 7)?;
-					let path = path::PathBuf::from(fields[1]);
-					let fd = Box::new(FileData {
-						tp: FileType::SymLink,
-						path: path.clone(),
-						mode: fields[2]
-							.parse()
-							.map_err(|e| format!("Invalid mode '{}': {}", fields[2], e))?,
-						user: fields[3]
-							.parse()
-							.map_err(|e| format!("Invalid user '{}': {}", fields[3], e))?,
-						group: fields[4]
-							.parse()
-							.map_err(|e| format!("Invalid group '{}': {}", fields[4], e))?,
-						ctime: fields[5]
-							.parse()
-							.map_err(|e| format!("Invalid ctime '{}': {}", fields[5], e))?,
-						mtime: fields[6]
-							.parse()
-							.map_err(|e| format!("Invalid mtime '{}': {}", fields[6], e))?,
-						size: 0,
-						chunks: vec![],
-					});
+					let fd = metadata_utils::parse_symlink_metadata(&buf)?;
+					let path = fd.path.clone();
 					self.dir.insert(fd.path.clone(), fd);
 					file_data = self.dir.get_mut(&path);
 				}
 				"D" => {
-					let fields = protocol_utils::parse_protocol_line(&buf, 7)?;
-					let path = path::PathBuf::from(fields[1]);
-					let fd = Box::new(FileData {
-						tp: FileType::Dir,
-						path: path.clone(),
-						mode: fields[2]
-							.parse()
-							.map_err(|e| format!("Invalid mode '{}': {}", fields[2], e))?,
-						user: fields[3]
-							.parse()
-							.map_err(|e| format!("Invalid user '{}': {}", fields[3], e))?,
-						group: fields[4]
-							.parse()
-							.map_err(|e| format!("Invalid group '{}': {}", fields[4], e))?,
-						ctime: fields[5]
-							.parse()
-							.map_err(|e| format!("Invalid ctime '{}': {}", fields[5], e))?,
-						mtime: fields[6]
-							.parse()
-							.map_err(|e| format!("Invalid mtime '{}': {}", fields[6], e))?,
-						size: 0,
-						chunks: vec![],
-					});
+					let fd = metadata_utils::parse_dir_metadata(&buf)?;
+					let path = fd.path.clone();
 					self.dir.insert(fd.path.clone(), fd);
 					file_data = self.dir.get_mut(&path);
 				}
