@@ -14,6 +14,84 @@ use crate::types::{Config, FileData, FileType, HashChunk, PreviousSyncState};
 // Sync //
 //////////
 
+/// Protocol version for handshake and compatibility checking
+const PROTOCOL_VERSION: u8 = 1;
+
+/// File locking mechanism to prevent concurrent sync operations
+struct FileLock {
+	path: path::PathBuf,
+}
+
+impl FileLock {
+	/// Acquire an exclusive lock on the sync state directory
+	fn acquire(syncr_dir: &path::Path) -> Result<Self, Box<dyn Error>> {
+		let lock_path = syncr_dir.join(".SyNcR-LOCK");
+
+		// Check if lock file already exists
+		if lock_path.exists() {
+			let _pid_str = std::fs::read_to_string(&lock_path)?;
+			return Err(format!(
+				"Sync already in progress (lock file exists at {}). \
+                 If this is stale, delete the lock file manually.",
+				lock_path.display()
+			)
+			.into());
+		}
+
+		// Create lock file with our PID
+		let pid = std::process::id();
+		std::fs::write(&lock_path, pid.to_string())?;
+
+		Ok(FileLock { path: lock_path })
+	}
+}
+
+impl Drop for FileLock {
+	fn drop(&mut self) {
+		// Remove lock file on drop (whether success or failure)
+		let _ = std::fs::remove_file(&self.path);
+	}
+}
+
+/// Perform protocol version handshake with a remote node
+/// Parent sends VERSION:<version>, child responds with VERSION:<version>
+async fn handshake(
+	send: &mut async_process::ChildStdin,
+	recv: &mut async_std::io::BufReader<async_process::ChildStdout>,
+) -> Result<(), Box<dyn Error>> {
+	// Read server's ready signal (.)
+	let mut buf = String::new();
+	recv.read_line(&mut buf).await?;
+	if buf.trim() != "." {
+		return Err("Expected ready signal from server".into());
+	}
+
+	// Send our protocol version
+	send.write_all(format!("VERSION:{}\n", PROTOCOL_VERSION).as_bytes()).await?;
+
+	// Read remote protocol version
+	buf.clear();
+	recv.read_line(&mut buf).await?;
+
+	let fields: Vec<&str> = buf.trim().split(':').collect();
+	if fields.len() != 2 || fields[0] != "VERSION" {
+		return Err("Invalid handshake response".into());
+	}
+
+	let remote_version: u8 =
+		fields[1].parse().map_err(|_| "Invalid version number in handshake")?;
+
+	if remote_version != PROTOCOL_VERSION {
+		return Err(format!(
+			"Protocol version mismatch: local={}, remote={}",
+			PROTOCOL_VERSION, remote_version
+		)
+		.into());
+	}
+
+	Ok(())
+}
+
 // RAII guard to restore terminal settings on drop (prevents broken terminal on panic)
 struct TerminalGuard {
 	fd: i32,
@@ -21,13 +99,18 @@ struct TerminalGuard {
 }
 
 impl TerminalGuard {
-	fn new() -> Result<Self, Box<dyn Error>> {
+	fn new() -> Option<Self> {
 		let fd = 0; // stdin
-		let original = Termios::from_fd(fd)?;
+		let original = match Termios::from_fd(fd) {
+			Ok(term) => term,
+			Err(_) => return None, // Not a terminal
+		};
 		let mut new_termios = original;
 		new_termios.c_lflag &= !(ICANON | ECHO);
-		tcsetattr(fd, TCSANOW, &new_termios)?;
-		Ok(TerminalGuard { fd, original })
+		if tcsetattr(fd, TCSANOW, &new_termios).is_err() {
+			return None; // Failed to set terminal mode
+		}
+		Some(TerminalGuard { fd, original })
 	}
 }
 
@@ -76,7 +159,7 @@ impl NodeState {
 					writeln!(
 						self.send.lock().await,
 						"FD:{}:{}:{}:{}:{}:{}:{}",
-						file.path.to_str().expect(""),
+						file.path.to_string_lossy(),
 						file.mode,
 						file.user,
 						file.group,
@@ -114,7 +197,7 @@ impl NodeState {
 					writeln!(
 						self.send.lock().await,
 						"FM:{}:{}:{}:{}:{}:{}:{}",
-						file.path.to_str().expect(""),
+						file.path.to_string_lossy(),
 						file.mode,
 						file.user,
 						file.group,
@@ -129,7 +212,7 @@ impl NodeState {
 				writeln!(
 					self.send.lock().await,
 					"L:{}:{}:{}:{}:{}:{}",
-					file.path.to_str().expect(""),
+					file.path.to_string_lossy(),
 					file.mode,
 					file.user,
 					file.group,
@@ -142,7 +225,7 @@ impl NodeState {
 				writeln!(
 					self.send.lock().await,
 					"D:{}:{}:{}:{}:{}:{}",
-					file.path.to_str().expect(""),
+					file.path.to_string_lossy(),
 					file.mode,
 					file.user,
 					file.group,
@@ -164,15 +247,8 @@ impl NodeState {
 		let mut buf = String::new();
 		let mut file_data: Option<&mut Box<FileData>> = None;
 
-		loop {
-			buf.clear();
-			self.recv.lock().await.read_line(&mut buf).await?;
-			if buf.trim() == "." {
-				break;
-			}
-			//eprintln!("[{}]HDR: {}", self.id, buf.trim());
-		}
-
+		// Note: Handshake already consumed the initialization "." message,
+		// so we don't need to read it again here. Just send LIST directly.
 		self.send.lock().await.write_all(b"LIST\n").await?;
 		loop {
 			buf.clear();
@@ -363,6 +439,10 @@ async fn load_previous_state(config: &Config) -> Result<Option<PreviousSyncState
 }
 
 pub async fn sync(config: Config, dirs: Vec<&str>) -> Result<(), Box<dyn Error>> {
+	// Acquire lock to prevent concurrent sync operations
+	eprintln!("Acquiring lock...");
+	let _lock = FileLock::acquire(&config.syncr_dir)?;
+
 	let mut state = SyncState { nodes: Vec::new() };
 	//let mut tree: BTreeMap<path::PathBuf, u8> = BTreeMap::new();
 	let mut tree: BTreeMap<path::PathBuf, Box<FileData>> = BTreeMap::new();
@@ -370,18 +450,20 @@ pub async fn sync(config: Config, dirs: Vec<&str>) -> Result<(), Box<dyn Error>>
 	// Load previous sync state for three-way merge detection
 	eprintln!("Loading previous state...");
 	let previous_state = load_previous_state(&config).await?;
-	if previous_state.is_some() {
-		eprintln!(
-			"Loaded previous state with {} files",
-			previous_state.as_ref().unwrap().files.len()
-		);
+	if let Some(ref pstate) = previous_state {
+		eprintln!("Loaded previous state with {} files", pstate.files.len());
 	} else {
 		eprintln!("No previous state found (first sync)");
 	}
 
 	eprintln!("Initializing processes...");
 	for dir in dirs {
-		let conn = connect::connect(dir).await?;
+		let mut conn = connect::connect(dir).await?;
+
+		// Perform protocol handshake
+		eprintln!("Handshaking with {}...", dir);
+		handshake(&mut conn.send, &mut conn.recv).await?;
+
 		state.add_node(conn.send, conn.recv);
 	}
 
@@ -392,11 +474,19 @@ pub async fn sync(config: Config, dirs: Vec<&str>) -> Result<(), Box<dyn Error>>
 	}
 	future::join_all(futs).await;
 
+	for node in state.nodes.iter() {
+		for path in node.dir.keys() {
+			eprintln!("  - {}", path.display());
+		}
+	}
+
 	// Do diffing
 	eprintln!("Running diff...");
 
 	// Configure terminal for key input (RAII guard ensures cleanup on panic)
-	let _terminal_guard = TerminalGuard::new()?;
+	// This will be None if stdin is not a terminal (e.g., piped input)
+	let _terminal_guard = TerminalGuard::new();
+	let interactive_mode = _terminal_guard.is_some();
 
 	let mut diff: BTreeMap<&path::Path, SyncOption<u8>> = BTreeMap::new();
 	for node in &state.nodes {
@@ -413,7 +503,6 @@ pub async fn sync(config: Config, dirs: Vec<&str>) -> Result<(), Box<dyn Error>>
 				let mut winner: SyncOption<u8> = SyncOption::None;
 
 				// Compare files on all nodes and find where to sync from
-				//eprintln!("File: {:?}", &path);
 				for (idx, file) in files.iter().enumerate() {
 					if let Some(f) = file {
 						// Three-way merge: compare with previous state if available
@@ -459,26 +548,33 @@ pub async fn sync(config: Config, dirs: Vec<&str>) -> Result<(), Box<dyn Error>>
 					winner = SyncOption::None;
 				}
 				if winner.is_conflict() {
-					eprintln!("File: {:?}", winner);
 					for (idx, file) in files.iter().enumerate() {
 						if let Some(f) = file {
 							eprintln!("    {}: {:?}", idx + 1, f);
 						}
 					}
-					loop {
-						eprint!("? ");
-						let mut buf = [0; 1];
-						let keypress = io::stdin().read(&mut buf).map(|_| buf[0]);
-						if let Ok(key) = keypress {
-							eprintln!("{:?}", key);
-							if b'1' <= key && key <= b'0' + files.len() as u8 {
-								winner = SyncOption::Some(key - b'1');
-								break;
-							} else if key == b's' {
-								winner = SyncOption::None;
-								break;
+
+					if interactive_mode {
+						// Interactive mode: prompt user for conflict resolution
+						loop {
+							eprint!("? ");
+							let mut buf = [0; 1];
+							let keypress = io::stdin().read(&mut buf).map(|_| buf[0]);
+							if let Ok(key) = keypress {
+								eprintln!("{:?}", key);
+								if b'1' <= key && key <= b'0' + files.len() as u8 {
+									winner = SyncOption::Some(key - b'1');
+									break;
+								} else if key == b's' {
+									winner = SyncOption::None;
+									break;
+								}
 							}
 						}
+					} else {
+						// Non-interactive mode: skip conflicts by default
+						eprintln!("(non-interactive mode: skipping conflict)");
+						winner = SyncOption::None;
 					}
 				}
 				if let SyncOption::Some(win) = winner {
@@ -538,7 +634,8 @@ pub async fn sync(config: Config, dirs: Vec<&str>) -> Result<(), Box<dyn Error>>
 		json.push_str(serde_json::to_string(state.nodes[node as usize].dir.get(&file).unwrap()).unwrap().as_str());
 	}
 	*/
-	let json = serde_json::to_string(&tree).unwrap();
+	let json = serde_json::to_string(&tree)
+		.map_err(|e| format!("Failed to serialize state to JSON: {}", e))?;
 	eprintln!("JSON: {}", json);
 	let fname = config.syncr_dir.clone().join("test.profile.json");
 	let mut f = afs::File::create(&fname).await?;

@@ -16,37 +16,30 @@ mod util;
 // Utility functions //
 ///////////////////////
 
-fn init_syncr_dir() -> path::PathBuf {
+fn init_syncr_dir() -> Result<path::PathBuf, Box<dyn Error>> {
 	match env::var("HOME") {
 		Ok(home) => {
 			let syncr_dir = path::PathBuf::from(home).join(".syncr");
-			println!("rcfile: {:?}", syncr_dir);
+			eprintln!("rcfile: {:?}", syncr_dir);
 
 			match fs::metadata(&syncr_dir) {
 				Ok(meta) => {
 					if meta.is_dir() {
-						syncr_dir
+						Ok(syncr_dir)
 					} else {
-						eprintln!(
-							"{} exists, but it is not a directory!",
-							syncr_dir.to_str().unwrap()
-						);
-						panic!()
+						Err(format!("{} exists, but it is not a directory!", syncr_dir.display())
+							.into())
 					}
 				}
 				Err(_err) => {
 					// Not exists
-					if let Err(err) = fs::create_dir(&syncr_dir) {
-						panic!("Cannot create directory: {:?}", err);
-					}
-					syncr_dir
+					fs::create_dir(&syncr_dir)
+						.map_err(|err| format!("Cannot create directory: {}", err))?;
+					Ok(syncr_dir)
 				}
 			}
 		}
-		Err(_e) => {
-			eprintln!("Could not determine HOME directory!");
-			panic!()
-		}
+		Err(_e) => Err("Could not determine HOME directory!".into()),
 	}
 }
 
@@ -81,10 +74,10 @@ fn main() -> Result<(), Box<dyn Error>> {
 		.get_matches();
 
 	if let Some(matches) = matches.subcommand_matches("serve") {
-		let dir = matches.get_one::<String>("dir").expect("ERROR");
+		let dir = matches.get_one::<String>("dir").ok_or("serve: directory argument required")?;
 		return serve::serve(dir);
 	} else if let Some(matches) = matches.subcommand_matches("dump") {
-		let dir = matches.get_one::<String>("dir").expect("ERROR");
+		let dir = matches.get_one::<String>("dir").ok_or("dump: directory argument required")?;
 		env::set_current_dir(dir)?;
 		let dump_state = serve::serve_list(path::PathBuf::from("."))?;
 
@@ -93,7 +86,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 		}
 	} else if let Some(sub_matches) = matches.subcommand_matches("sync") {
 		let config = Config {
-			syncr_dir: init_syncr_dir(),
+			syncr_dir: init_syncr_dir()?,
 			profile: matches
 				.get_one::<String>("profile")
 				.map(|s| s.as_str())
@@ -103,7 +96,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 		let dirs: Vec<&str> = sub_matches
 			.get_many::<String>("dir")
-			.expect("ERROR")
+			.ok_or("sync: at least one directory argument required")?
 			.map(|s| s.as_str())
 			.collect();
 		let _ = task::block_on(sync::sync(config, dirs));

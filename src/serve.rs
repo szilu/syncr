@@ -13,6 +13,9 @@ use crate::config;
 use crate::types::{FileChunk, FileData, FileType, HashChunk};
 use crate::util;
 
+/// Protocol version for handshake and compatibility checking
+const PROTOCOL_VERSION: u8 = 1;
+
 // Type alias for complex async function return type
 type BoxedAsyncResult<'a> =
 	Pin<Box<dyn std::future::Future<Output = Result<(), Box<dyn Error>>> + 'a>>;
@@ -20,6 +23,35 @@ type BoxedAsyncResult<'a> =
 ///////////
 // Utils //
 ///////////
+
+/// Validate that a path is safe to use (prevents directory traversal/injection attacks)
+/// Only allows relative paths without parent directory references
+fn validate_path(path: &path::Path) -> Result<(), Box<dyn Error>> {
+	// Reject absolute paths
+	if path.is_absolute() {
+		return Err("Absolute paths are not allowed".into());
+	}
+
+	// Reject paths with parent directory components (..)
+	for component in path.components() {
+		if component == std::path::Component::ParentDir {
+			return Err("Parent directory traversal (..) is not allowed".into());
+		}
+	}
+
+	// Reject current directory references (.) - they're redundant and could be suspicious
+	if path.as_os_str().is_empty() {
+		return Err("Empty paths are not allowed".into());
+	}
+
+	// Additional check: reject paths that are exactly "."
+	if path == path::Path::new(".") {
+		return Err("Current directory reference (.) is not allowed".into());
+	}
+
+	Ok(())
+}
+
 #[allow(dead_code)]
 fn tmp_filename(path: &path::Path) -> path::PathBuf {
 	let mut filepath = path::PathBuf::from(path);
@@ -131,7 +163,7 @@ fn traverse_dir<'a>(state: &'a mut DumpState, dir: path::PathBuf) -> BoxedAsyncR
 			if meta.is_file() {
 				println!(
 					"F:{}:{}:{}:{}:{}:{}:{}",
-					&path.to_str().unwrap(),
+					&path.to_string_lossy(),
 					meta.mode(),
 					meta.uid(),
 					meta.gid(),
@@ -178,7 +210,7 @@ fn traverse_dir<'a>(state: &'a mut DumpState, dir: path::PathBuf) -> BoxedAsyncR
 			if meta.file_type().is_symlink() {
 				println!(
 					"L:{}:{}:{}:{}:{}:{}",
-					&path.to_str().unwrap(),
+					&path.to_string_lossy(),
 					meta.mode(),
 					meta.uid(),
 					meta.gid(),
@@ -189,7 +221,7 @@ fn traverse_dir<'a>(state: &'a mut DumpState, dir: path::PathBuf) -> BoxedAsyncR
 			if meta.is_dir() {
 				println!(
 					"D:{}:{}:{}:{}:{}:{}",
-					&path.to_str().unwrap(),
+					&path.to_string_lossy(),
 					meta.mode(),
 					meta.uid(),
 					meta.gid(),
@@ -222,7 +254,9 @@ async fn serve_read(dir: path::PathBuf, dump_state: &DumpState) -> Result<(), Bo
 	let mut buf = String::new();
 	loop {
 		buf.clear();
-		io::stdin().read_line(&mut buf).expect("Failed to read");
+		io::stdin()
+			.read_line(&mut buf)
+			.map_err(|e| format!("Failed to read chunk hashes: {}", e))?;
 		if buf.trim() == "." {
 			break;
 		}
@@ -270,6 +304,9 @@ async fn serve_write(dir: path::PathBuf, dump_state: &DumpState) -> Result<(), B
 				let fields = DumpState::parse_protocol_line(&buf, 2)?;
 				let path = path::PathBuf::from(fields[1]);
 
+				// Validate path to prevent directory traversal attacks
+				validate_path(&path)?;
+
 				eprintln!("DELETE: {:?}", &path);
 
 				// Remove the file
@@ -284,6 +321,10 @@ async fn serve_write(dir: path::PathBuf, dump_state: &DumpState) -> Result<(), B
 			"FM" | "FD" => {
 				let fields = DumpState::parse_protocol_line(&buf, 8)?;
 				let path = path::PathBuf::from(fields[1]);
+
+				// Validate path to prevent directory traversal attacks
+				validate_path(&path)?;
+
 				let fd = Box::new(FileData {
 					tp: FileType::File,
 					path: path.clone(),
@@ -515,16 +556,45 @@ pub fn serve(dir: &str) -> Result<(), Box<dyn Error>> {
 	// Clean up orphaned temp files from any interrupted previous syncs
 	cleanup_temp_files(path::Path::new("."))?;
 
-	println!("VERSION:1");
+	// Signal that we're ready to receive commands (do NOT send VERSION here,
+	// wait for the client to initiate the handshake with VERSION)
 	println!(".");
 
 	let mut dump_state: Option<DumpState> = None;
 
 	loop {
 		let mut cmdline = String::new();
-		io::stdin().read_line(&mut cmdline).expect("Failed to read command");
+		match io::stdin().read_line(&mut cmdline) {
+			Ok(0) => break, // EOF reached
+			Ok(_) => {}
+			Err(e) => {
+				eprintln!("Failed to read command: {}", e);
+				break;
+			}
+		}
 
 		match cmdline.trim() {
+			cmd if cmd.starts_with("VERSION") => {
+				// Handle version handshake
+				let version = if let Some(v) = cmd.strip_prefix("VERSION:") {
+					v.parse::<u8>().unwrap_or(0)
+				} else {
+					0
+				};
+
+				if version == PROTOCOL_VERSION {
+					println!("VERSION:{}", PROTOCOL_VERSION);
+				} else {
+					eprintln!(
+						"ERROR: Protocol version mismatch: client={}, server={}",
+						version, PROTOCOL_VERSION
+					);
+					println!(
+						"ERROR:Protocol version mismatch: expected {}, got {}",
+						PROTOCOL_VERSION, version
+					);
+				}
+			}
 			"LIST" => dump_state = Some(serve_list(path::PathBuf::from("."))?),
 			"READ" => match &dump_state {
 				Some(state) => task::block_on(serve_read(path::PathBuf::from("."), state))?,
@@ -549,4 +619,41 @@ pub fn serve(dir: &str) -> Result<(), Box<dyn Error>> {
 		}
 	}
 	Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn test_validate_path_allows_relative_paths() {
+		assert!(validate_path(path::Path::new("file.txt")).is_ok());
+		assert!(validate_path(path::Path::new("dir/file.txt")).is_ok());
+		assert!(validate_path(path::Path::new("a/b/c/d.txt")).is_ok());
+	}
+
+	#[test]
+	fn test_validate_path_rejects_absolute_paths() {
+		assert!(validate_path(path::Path::new("/etc/passwd")).is_err());
+		assert!(validate_path(path::Path::new("/home/user/file.txt")).is_err());
+		assert!(validate_path(path::Path::new("/")).is_err());
+	}
+
+	#[test]
+	fn test_validate_path_rejects_parent_traversal() {
+		assert!(validate_path(path::Path::new("../etc/passwd")).is_err());
+		assert!(validate_path(path::Path::new("file/../../../etc/passwd")).is_err());
+		assert!(validate_path(path::Path::new("..")).is_err());
+		assert!(validate_path(path::Path::new("dir/..")).is_err());
+	}
+
+	#[test]
+	fn test_validate_path_rejects_current_dir() {
+		assert!(validate_path(path::Path::new(".")).is_err());
+	}
+
+	#[test]
+	fn test_validate_path_rejects_empty_paths() {
+		assert!(validate_path(path::Path::new("")).is_err());
+	}
 }
