@@ -6,12 +6,15 @@ use crate::types::Config;
 
 mod config;
 mod connect;
+mod logging;
 mod metadata_utils;
 mod protocol_utils;
 mod serve;
 mod sync_impl; // Private sync implementation
 mod types;
 mod util;
+
+use logging::*;
 
 ///////////////////////
 // Utility functions //
@@ -21,7 +24,7 @@ fn init_syncr_dir() -> Result<path::PathBuf, Box<dyn Error>> {
 	match env::var("HOME") {
 		Ok(home) => {
 			let syncr_dir = path::PathBuf::from(home).join(".syncr");
-			eprintln!("rcfile: {:?}", syncr_dir);
+			debug!("rcfile: {:?}", syncr_dir);
 
 			match fs::metadata(&syncr_dir) {
 				Ok(meta) => {
@@ -46,6 +49,9 @@ fn init_syncr_dir() -> Result<path::PathBuf, Box<dyn Error>> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+	// Initialize tracing subscriber
+	logging::init_tracing();
+
 	let matches = Command::new("SyncR")
 		.version("0.1.0")
 		.author("Szilard Hajba <szilard@symbion.hu>")
@@ -84,7 +90,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 		let dump_state = serve::serve_list(path::PathBuf::from("."))?;
 
 		for (h, p) in &dump_state.chunks {
-			eprintln!("{}: {:?}", h, p);
+			info!("{}: {:?}", h, p);
 		}
 	} else if let Some(sub_matches) = matches.subcommand_matches("sync") {
 		let config = Config {

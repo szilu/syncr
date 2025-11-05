@@ -1,3 +1,4 @@
+use crate::logging::*;
 use std::error::Error;
 use std::process::Stdio;
 use tokio::io::BufReader;
@@ -14,7 +15,7 @@ pub async fn connect(dir: &str) -> Result<Connect, Box<dyn Error>> {
 	{
 		let host = &dir[..colon_pos];
 		let path = &dir[colon_pos + 1..];
-		println!("Connecting {} : {}", &host, &path);
+		info!("Connecting {} : {}", &host, &path);
 		child = tokio::process::Command::new("ssh")
 			.arg(host)
 			.arg("syncr")

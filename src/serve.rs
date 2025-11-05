@@ -11,6 +11,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 //use std::{thread, time};
 
 use crate::config;
+use crate::logging::*;
 #[allow(unused_imports)]
 use crate::metadata_utils;
 use crate::protocol_utils;
@@ -303,7 +304,7 @@ async fn serve_write(dir: path::PathBuf, dump_state: &DumpState) -> Result<(), B
 				// Validate path to prevent directory traversal attacks
 				validate_path(&path)?;
 
-				eprintln!("DELETE: {:?}", &path);
+				debug!("DELETE: {:?}", &path);
 
 				// Remove the file
 				if afs::metadata(&path).await.is_ok() {
@@ -341,7 +342,7 @@ async fn serve_write(dir: path::PathBuf, dump_state: &DumpState) -> Result<(), B
 				// FIXME: Should create temp dir, but then all paths must be altered!
 				//filename.push(".SyNcR-TmP");
 				filepath.set_file_name(filename);
-				eprintln!("MKDIR {:?}", &filepath);
+				debug!("MKDIR {:?}", &filepath);
 				afs::create_dir(&filepath).await?;
 				afs::set_permissions(&filepath, std::fs::Permissions::from_mode(fd.mode)).await?;
 				dump_state.rename.borrow_mut().insert(filepath.clone(), path.clone());
@@ -412,7 +413,7 @@ async fn serve_write(dir: path::PathBuf, dump_state: &DumpState) -> Result<(), B
 						};
 						//let filepath = tmp_filename(&fc.path);
 						if let Err(e) = dump_state.write_chunk(&fc.path, &hc, &chunk).await {
-							eprintln!("ERROR WRITING {}", e);
+							error!("ERROR WRITING {}", e);
 						}
 					}
 					dump_state.missing.borrow_mut().remove(hash);
@@ -440,9 +441,9 @@ async fn serve_commit(
 		let missing = dump_state.missing.borrow();
 		if !missing.is_empty() {
 			let missing_hashes: Vec<&String> = missing.keys().collect();
-			eprintln!("ERROR: Cannot commit - {} missing chunks", missing.len());
+			error!("Cannot commit - {} missing chunks", missing.len());
 			for hash in &missing_hashes {
-				eprintln!("  Missing chunk: {}", hash);
+				error!("  Missing chunk: {}", hash);
 			}
 			println!("ERROR:Cannot commit with {} missing chunks", missing.len());
 			return Err(format!("Cannot commit: {} chunks still missing", missing.len()).into());
@@ -465,7 +466,7 @@ async fn serve_commit(
 
 // Clean up orphaned temporary files from interrupted syncs
 fn cleanup_temp_files(dir: &path::Path) -> Result<(), Box<dyn Error>> {
-	eprintln!("Cleaning up orphaned temporary files...");
+	info!("Cleaning up orphaned temporary files...");
 	let mut count = 0;
 
 	// Walk directory tree looking for .SyNcR-TmP files (synchronous version)
@@ -478,7 +479,7 @@ fn cleanup_temp_files(dir: &path::Path) -> Result<(), Box<dyn Error>> {
 			if let Some(name) = path.file_name() {
 				if let Some(name_str) = name.to_str() {
 					if name_str.ends_with(".SyNcR-TmP") {
-						eprintln!("  Removing orphaned temp file: {:?}", path);
+						debug!("Removing orphaned temp file: {:?}", path);
 						if metadata.is_file() {
 							fs::remove_file(&path)?;
 						} else if metadata.is_dir() {
@@ -498,7 +499,7 @@ fn cleanup_temp_files(dir: &path::Path) -> Result<(), Box<dyn Error>> {
 	}
 
 	scan_dir(dir, &mut count)?;
-	eprintln!("Cleaned up {} temporary files", count);
+	info!("Cleaned up {} temporary files", count);
 	Ok(())
 }
 
@@ -520,7 +521,7 @@ pub fn serve(dir: &str) -> Result<(), Box<dyn Error>> {
 			Ok(0) => break, // EOF reached
 			Ok(_) => {}
 			Err(e) => {
-				eprintln!("Failed to read command: {}", e);
+				error!("Failed to read command: {}", e);
 				break;
 			}
 		}
@@ -537,8 +538,8 @@ pub fn serve(dir: &str) -> Result<(), Box<dyn Error>> {
 				if version == PROTOCOL_VERSION {
 					println!("VERSION:{}", PROTOCOL_VERSION);
 				} else {
-					eprintln!(
-						"ERROR: Protocol version mismatch: client={}, server={}",
+					error!(
+						"Protocol version mismatch: client={}, server={}",
 						version, PROTOCOL_VERSION
 					);
 					println!(

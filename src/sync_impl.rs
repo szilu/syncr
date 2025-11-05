@@ -10,6 +10,7 @@ use tokio::sync::Mutex;
 
 // Use the old connect module directly (not the new connection.rs library API)
 use crate::connect;
+use crate::logging::*;
 #[allow(unused_imports)]
 use crate::metadata_utils;
 use crate::protocol_utils;
@@ -346,7 +347,7 @@ async fn load_previous_state(config: &Config) -> Result<Option<PreviousSyncState
 
 pub async fn sync(config: Config, dirs: Vec<&str>) -> Result<(), Box<dyn Error>> {
 	// Acquire lock to prevent concurrent sync operations
-	eprintln!("Acquiring lock...");
+	info!("Acquiring lock...");
 	let _lock = FileLock::acquire(&config.syncr_dir)?;
 
 	let mut state = SyncState { nodes: Vec::new() };
@@ -354,26 +355,26 @@ pub async fn sync(config: Config, dirs: Vec<&str>) -> Result<(), Box<dyn Error>>
 	let mut tree: BTreeMap<path::PathBuf, Box<FileData>> = BTreeMap::new();
 
 	// Load previous sync state for three-way merge detection
-	eprintln!("Loading previous state...");
+	info!("Loading previous state...");
 	let previous_state = load_previous_state(&config).await?;
 	if let Some(ref pstate) = previous_state {
-		eprintln!("Loaded previous state with {} files", pstate.files.len());
+		info!("Loaded previous state with {} files", pstate.files.len());
 	} else {
-		eprintln!("No previous state found (first sync)");
+		info!("No previous state found (first sync)");
 	}
 
-	eprintln!("Initializing processes...");
+	info!("Initializing processes...");
 	for dir in dirs {
 		let mut conn = connect::connect(dir).await?;
 
 		// Perform protocol handshake
-		eprintln!("Handshaking with {}...", dir);
+		info!("Handshaking with {}...", dir);
 		handshake(&mut conn.send, &mut conn.recv).await?;
 
 		state.add_node(conn.send, conn.recv);
 	}
 
-	eprintln!("Collecting...");
+	info!("Collecting...");
 	let mut futs: Vec<Pin<Box<dyn future::Future<Output = _>>>> = vec![];
 	for node in &mut state.nodes {
 		futs.push(Box::pin(node.do_collect()));
@@ -382,12 +383,12 @@ pub async fn sync(config: Config, dirs: Vec<&str>) -> Result<(), Box<dyn Error>>
 
 	for node in state.nodes.iter() {
 		for path in node.dir.keys() {
-			eprintln!("  - {}", path.display());
+			debug!("  - {}", path.display());
 		}
 	}
 
 	// Do diffing
-	eprintln!("Running diff...");
+	info!("Running diff...");
 
 	// Configure terminal for key input (RAII guard ensures cleanup on panic)
 	// This will be None if stdin is not a terminal (e.g., piped input)
@@ -417,7 +418,7 @@ pub async fn sync(config: Config, dirs: Vec<&str>) -> Result<(), Box<dyn Error>>
 								|| f.mode != prev.mode || f.user != prev.user
 								|| f.group != prev.group || f.chunks != prev.chunks
 							{
-								eprintln!(
+								debug!(
 									"diff {} {} {} {} {} (modified since last sync)",
 									f.tp != prev.tp,
 									f.mode != prev.mode,
@@ -446,7 +447,7 @@ pub async fn sync(config: Config, dirs: Vec<&str>) -> Result<(), Box<dyn Error>>
 							}
 						}
 					} else {
-						eprintln!("Node: {} <missing>", idx);
+						debug!("Node: {} <missing>", idx);
 					}
 				}
 				files.dedup();
@@ -456,7 +457,7 @@ pub async fn sync(config: Config, dirs: Vec<&str>) -> Result<(), Box<dyn Error>>
 				if winner.is_conflict() {
 					for (idx, file) in files.iter().enumerate() {
 						if let Some(f) = file {
-							eprintln!("    {}: {:?}", idx + 1, f);
+							warn!("    {}: {:?}", idx + 1, f);
 						}
 					}
 
@@ -467,7 +468,7 @@ pub async fn sync(config: Config, dirs: Vec<&str>) -> Result<(), Box<dyn Error>>
 							let mut buf = [0; 1];
 							let keypress = io::stdin().read(&mut buf).map(|_| buf[0]);
 							if let Ok(key) = keypress {
-								eprintln!("{:?}", key);
+								debug!("{:?}", key);
 								if b'1' <= key && key <= b'0' + files.len() as u8 {
 									winner = SyncOption::Some(key - b'1');
 									break;
@@ -479,7 +480,7 @@ pub async fn sync(config: Config, dirs: Vec<&str>) -> Result<(), Box<dyn Error>>
 						}
 					} else {
 						// Non-interactive mode: skip conflicts by default
-						eprintln!("(non-interactive mode: skipping conflict)");
+						warn!("(non-interactive mode: skipping conflict)");
 						winner = SyncOption::None;
 					}
 				}
@@ -522,12 +523,12 @@ pub async fn sync(config: Config, dirs: Vec<&str>) -> Result<(), Box<dyn Error>>
 
 			if !exists_on_any_node {
 				// File was in previous state but is missing from all nodes
-				eprintln!("File was deleted: {}", prev_path);
+				debug!("File was deleted: {}", prev_path);
 				deleted_files.push(prev_path.clone());
 			}
 		}
 	}
-	eprintln!("Found {} deleted files", deleted_files.len());
+	info!("Found {} deleted files", deleted_files.len());
 
 	// Terminal will be automatically restored by TerminalGuard when it goes out of scope
 
@@ -542,13 +543,13 @@ pub async fn sync(config: Config, dirs: Vec<&str>) -> Result<(), Box<dyn Error>>
 	*/
 	let json = serde_json::to_string(&tree)
 		.map_err(|e| format!("Failed to serialize state to JSON: {}", e))?;
-	eprintln!("JSON: {}", json);
+	debug!("JSON: {}", json);
 	let fname = config.syncr_dir.clone().join("test.profile.json");
 	let mut f = afs::File::create(&fname).await?;
 	f.write_all(json.as_bytes()).await?;
 
 	// Do write meta
-	eprintln!("Sending metadata...");
+	info!("Sending metadata...");
 	for node in &state.nodes {
 		node.send("WRITE").await?;
 	}
@@ -584,7 +585,7 @@ pub async fn sync(config: Config, dirs: Vec<&str>) -> Result<(), Box<dyn Error>>
 	}
 
 	// Send delete commands for files that were deleted
-	eprintln!("Sending delete commands...");
+	info!("Sending delete commands...");
 	for deleted_path in &deleted_files {
 		for node in &state.nodes {
 			node.send(&format!("DEL:{}", deleted_path)).await?;
@@ -592,10 +593,10 @@ pub async fn sync(config: Config, dirs: Vec<&str>) -> Result<(), Box<dyn Error>>
 	}
 
 	// Do chunk transfers
-	eprintln!("Transfering data chunks...");
+	info!("Transfering data chunks...");
 	let mut done: BTreeSet<String> = BTreeSet::new();
 	for srcnode in &state.nodes {
-		eprintln!("  - NODE {}", srcnode.id);
+		debug!("  - NODE {}", srcnode.id);
 		srcnode.send(".\nREAD").await?;
 		for dstnode in &state.nodes {
 			if dstnode != srcnode {
@@ -652,7 +653,7 @@ pub async fn sync(config: Config, dirs: Vec<&str>) -> Result<(), Box<dyn Error>>
 	}
 
 	// Commit modifications (do renames)
-	eprintln!("Commiting changes...");
+	info!("Commiting changes...");
 	for node in &state.nodes {
 		node.send("COMMIT").await?;
 		// Wait for response and check for errors
