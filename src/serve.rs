@@ -1,6 +1,5 @@
 use async_std::{fs as afs, prelude::*, task};
 use base64::{engine::general_purpose, Engine as _};
-use glob;
 use rollsum::Bup;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -14,9 +13,14 @@ use crate::config;
 use crate::types::{FileChunk, FileData, FileType, HashChunk};
 use crate::util;
 
+// Type alias for complex async function return type
+type BoxedAsyncResult<'a> =
+	Pin<Box<dyn std::future::Future<Output = Result<(), Box<dyn Error>>> + 'a>>;
+
 ///////////
 // Utils //
 ///////////
+#[allow(dead_code)]
 fn tmp_filename(path: &path::Path) -> path::PathBuf {
 	let mut filepath = path::PathBuf::from(path);
 	let mut filename = path.file_name().expect("Protocol error!").to_os_string();
@@ -30,17 +34,14 @@ fn tmp_filename(path: &path::Path) -> path::PathBuf {
 //////////
 pub struct DumpState {
 	pub exclude: Vec<glob::Pattern>,
-	pub chunks: BTreeMap<String, Vec<Box<FileChunk>>>,
-	pub missing: RefCell<BTreeMap<String, Vec<Box<FileChunk>>>>,
+	pub chunks: BTreeMap<String, Vec<FileChunk>>,
+	pub missing: RefCell<BTreeMap<String, Vec<FileChunk>>>,
 	pub rename: RefCell<BTreeMap<path::PathBuf, path::PathBuf>>,
 }
 
 impl DumpState {
 	// Helper to safely parse protocol fields with validation
-	fn parse_protocol_line<'a>(
-		buf: &'a str,
-		expected_fields: usize,
-	) -> Result<Vec<&'a str>, Box<dyn Error>> {
+	fn parse_protocol_line(buf: &str, expected_fields: usize) -> Result<Vec<&str>, Box<dyn Error>> {
 		let fields: Vec<&str> = buf.trim().split(':').collect();
 		if fields.len() < expected_fields {
 			return Err(format!(
@@ -55,9 +56,9 @@ impl DumpState {
 	}
 
 	fn add_chunk(&mut self, hash: String, path: path::PathBuf, offset: u64, size: usize) {
-		let v = self.chunks.entry(hash).or_insert(Vec::new());
-		if v.iter().position(|p| &p.path == &path).is_none() {
-			v.push(Box::new(FileChunk { path, offset, size }));
+		let v = self.chunks.entry(hash).or_default();
+		if !v.iter().any(|p| p.path == path) {
+			v.push(FileChunk { path, offset, size });
 		}
 	}
 
@@ -97,7 +98,7 @@ impl DumpState {
 		&self,
 		path: &path::Path,
 		chunk: &HashChunk,
-		buf: &Vec<u8>,
+		buf: &[u8],
 	) -> Result<(), Box<dyn Error>> {
 		// Verify hash before writing to detect corruption during transfer
 		let computed_hash = util::hash(buf);
@@ -111,15 +112,12 @@ impl DumpState {
 
 		let mut f = afs::OpenOptions::new().write(true).create(true).open(&path).await?;
 		f.seek(io::SeekFrom::Start(chunk.offset)).await?;
-		f.write_all(&buf).await?;
+		f.write_all(buf).await?;
 		Ok(())
 	}
 }
 
-fn traverse_dir<'a>(
-	mut state: &'a mut DumpState,
-	dir: path::PathBuf,
-) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn Error>>> + 'a>> {
+fn traverse_dir<'a>(state: &'a mut DumpState, dir: path::PathBuf) -> BoxedAsyncResult<'a> {
 	Box::pin(async move {
 		for entry in fs::read_dir(&dir)? {
 			let entry = entry?;
@@ -199,7 +197,7 @@ fn traverse_dir<'a>(
 					meta.mtime()
 				);
 				//println!("D:{}:{}:{}", path.to_str().unwrap(), meta.uid(), meta.gid());
-				traverse_dir(&mut state, path).await?
+				traverse_dir(state, path).await?
 			}
 		}
 		Ok(())
@@ -234,23 +232,20 @@ async fn serve_read(dir: path::PathBuf, dump_state: &DumpState) -> Result<(), Bo
 	for chunk in &chunks {
 		let &fc_vec_opt = &dump_state.chunks.get(chunk);
 
-		match &fc_vec_opt {
-			Some(fc_vec) => {
-				let fc = &fc_vec[0];
-				let path = dir.join(&fc.path);
-				let mut f = afs::File::open(&path).await?;
-				let mut buf: Vec<u8> = vec![0; fc.size];
-				f.seek(io::SeekFrom::Start(fc.offset)).await?;
-				f.read(&mut buf).await?;
-				let encoded = general_purpose::STANDARD.encode(buf);
-				println!("C:{}", chunk);
-				for line in encoded.into_bytes().chunks(config::BASE64_LINE_LENGTH) {
-					io::stdout().write_all(line)?;
-					io::stdout().write_all(b"\n")?;
-				}
-				println!(".");
+		if let Some(fc_vec) = &fc_vec_opt {
+			let fc = &fc_vec[0];
+			let path = dir.join(&fc.path);
+			let mut f = afs::File::open(&path).await?;
+			let mut buf: Vec<u8> = vec![0; fc.size];
+			f.seek(io::SeekFrom::Start(fc.offset)).await?;
+			f.read(&mut buf).await?;
+			let encoded = general_purpose::STANDARD.encode(buf);
+			println!("C:{}", chunk);
+			for line in encoded.into_bytes().chunks(config::BASE64_LINE_LENGTH) {
+				io::stdout().write_all(line)?;
+				io::stdout().write_all(b"\n")?;
 			}
-			None => {}
+			println!(".");
 		}
 	}
 	println!(".");
@@ -270,6 +265,22 @@ async fn serve_write(dir: path::PathBuf, dump_state: &DumpState) -> Result<(), B
 		let cmd = fields[0];
 
 		match cmd {
+			"DEL" => {
+				// Delete command: remove file from node
+				let fields = DumpState::parse_protocol_line(&buf, 2)?;
+				let path = path::PathBuf::from(fields[1]);
+
+				eprintln!("DELETE: {:?}", &path);
+
+				// Remove the file
+				if afs::metadata(&path).await.is_ok() {
+					if afs::metadata(&path).await?.is_file() {
+						afs::remove_file(&path).await?;
+					} else if afs::metadata(&path).await?.is_dir() {
+						afs::remove_dir_all(&path).await?;
+					}
+				}
+			}
 			"FM" | "FD" => {
 				let fields = DumpState::parse_protocol_line(&buf, 8)?;
 				let path = path::PathBuf::from(fields[1]);
@@ -347,7 +358,7 @@ async fn serve_write(dir: path::PathBuf, dump_state: &DumpState) -> Result<(), B
 				if file.is_none() {
 					return Err("Protocol error: chunk command without file".into());
 				}
-				let hc = Box::new(HashChunk {
+				let hc = HashChunk {
 					hash: String::from(fields[3]),
 					offset: fields[1]
 						.parse()
@@ -355,7 +366,7 @@ async fn serve_write(dir: path::PathBuf, dump_state: &DumpState) -> Result<(), B
 					size: fields[2]
 						.parse()
 						.map_err(|e| format!("Invalid size '{}': {}", fields[2], e))?,
-				});
+				};
 				if cmd == "LC" {
 					// Local chunk, copy it locally
 					let buf = dump_state
@@ -368,8 +379,8 @@ async fn serve_write(dir: path::PathBuf, dump_state: &DumpState) -> Result<(), B
 				} else {
 					// Remote chunk, add to wait list
 					let mut missing = dump_state.missing.borrow_mut();
-					let v = missing.entry(String::from(fields[3])).or_insert(Vec::new());
-					v.push(Box::new(FileChunk {
+					let v = missing.entry(String::from(fields[3])).or_default();
+					v.push(FileChunk {
 						path: filepath.clone(),
 						offset: fields[1]
 							.parse()
@@ -377,7 +388,7 @@ async fn serve_write(dir: path::PathBuf, dump_state: &DumpState) -> Result<(), B
 						size: fields[2]
 							.parse()
 							.map_err(|e| format!("Invalid size '{}': {}", fields[2], e))?,
-					}));
+					});
 				}
 			}
 			"C" => {
@@ -392,26 +403,26 @@ async fn serve_write(dir: path::PathBuf, dump_state: &DumpState) -> Result<(), B
 						break;
 					}
 					//eprintln!("DECODE: [{:?}]", &buf.trim());
-					chunk.append(&mut general_purpose::STANDARD.decode(&buf.trim())?);
+					chunk.append(&mut general_purpose::STANDARD.decode(buf.trim())?);
 				}
 				//eprintln!("DECODED CHUNK: {:?}", chunk);
-				let mut missing = dump_state.missing.borrow_mut();
-				match missing.get(hash) {
-					Some(fc_vec) => {
-						for fc in fc_vec {
-							let hc = HashChunk {
-								hash: String::from(hash),
-								offset: fc.offset,
-								size: fc.size,
-							};
-							//let filepath = tmp_filename(&fc.path);
-							if let Err(e) = dump_state.write_chunk(&fc.path, &hc, &chunk).await {
-								eprintln!("ERROR WRITING {}", e);
-							}
+				let fc_vec_opt = {
+					let missing = dump_state.missing.borrow();
+					missing.get(hash).cloned()
+				};
+				if let Some(fc_vec) = fc_vec_opt {
+					for fc in fc_vec {
+						let hc = HashChunk {
+							hash: String::from(hash),
+							offset: fc.offset,
+							size: fc.size,
+						};
+						//let filepath = tmp_filename(&fc.path);
+						if let Err(e) = dump_state.write_chunk(&fc.path, &hc, &chunk).await {
+							eprintln!("ERROR WRITING {}", e);
 						}
-						missing.remove(hash);
 					}
-					None => {}
+					dump_state.missing.borrow_mut().remove(hash);
 				}
 			}
 			"." => {
@@ -432,19 +443,25 @@ async fn serve_commit(
 	_fixme_dir: path::PathBuf,
 	dump_state: &DumpState,
 ) -> Result<(), Box<dyn Error>> {
-	let missing = dump_state.missing.borrow();
-	if missing.len() > 0 {
-		let missing_hashes: Vec<&String> = missing.keys().collect();
-		eprintln!("ERROR: Cannot commit - {} missing chunks", missing.len());
-		for hash in &missing_hashes {
-			eprintln!("  Missing chunk: {}", hash);
+	{
+		let missing = dump_state.missing.borrow();
+		if !missing.is_empty() {
+			let missing_hashes: Vec<&String> = missing.keys().collect();
+			eprintln!("ERROR: Cannot commit - {} missing chunks", missing.len());
+			for hash in &missing_hashes {
+				eprintln!("  Missing chunk: {}", hash);
+			}
+			println!("ERROR:Cannot commit with {} missing chunks", missing.len());
+			return Err(format!("Cannot commit: {} chunks still missing", missing.len()).into());
 		}
-		println!("ERROR:Cannot commit with {} missing chunks", missing.len());
-		return Err(format!("Cannot commit: {} chunks still missing", missing.len()).into());
 	}
-	drop(missing); // Release the borrow before rename operations
 
-	for (src, dst) in dump_state.rename.borrow().iter() {
+	let renames_to_do: Vec<(path::PathBuf, path::PathBuf)> = {
+		let rename = dump_state.rename.borrow();
+		rename.iter().map(|(src, dst)| (src.clone(), dst.clone())).collect()
+	};
+
+	for (src, dst) in renames_to_do {
 		//eprintln!("RENAME: {:?} -> {:?}", src, dst);
 		afs::rename(&src, &dst).await?;
 		//fs::rename(&src, &dst)?;
@@ -453,8 +470,51 @@ async fn serve_commit(
 	Ok(())
 }
 
+// Clean up orphaned temporary files from interrupted syncs
+fn cleanup_temp_files(dir: &path::Path) -> Result<(), Box<dyn Error>> {
+	eprintln!("Cleaning up orphaned temporary files...");
+	let mut count = 0;
+
+	// Walk directory tree looking for .SyNcR-TmP files (synchronous version)
+	fn scan_dir(dir: &path::Path, count: &mut u32) -> Result<(), Box<dyn Error>> {
+		for entry in fs::read_dir(dir)? {
+			let entry = entry?;
+			let path = entry.path();
+			let metadata = fs::symlink_metadata(&path)?;
+
+			if let Some(name) = path.file_name() {
+				if let Some(name_str) = name.to_str() {
+					if name_str.ends_with(".SyNcR-TmP") {
+						eprintln!("  Removing orphaned temp file: {:?}", path);
+						if metadata.is_file() {
+							fs::remove_file(&path)?;
+						} else if metadata.is_dir() {
+							fs::remove_dir_all(&path)?;
+						}
+						*count += 1;
+					}
+				}
+			}
+
+			// Recursively scan subdirectories
+			if metadata.is_dir() {
+				scan_dir(&path, count)?;
+			}
+		}
+		Ok(())
+	}
+
+	scan_dir(dir, &mut count)?;
+	eprintln!("Cleaned up {} temporary files", count);
+	Ok(())
+}
+
 pub fn serve(dir: &str) -> Result<(), Box<dyn Error>> {
-	env::set_current_dir(&dir)?;
+	env::set_current_dir(dir)?;
+
+	// Clean up orphaned temp files from any interrupted previous syncs
+	cleanup_temp_files(path::Path::new("."))?;
+
 	println!("VERSION:1");
 	println!(".");
 
@@ -464,22 +524,22 @@ pub fn serve(dir: &str) -> Result<(), Box<dyn Error>> {
 		let mut cmdline = String::new();
 		io::stdin().read_line(&mut cmdline).expect("Failed to read command");
 
-		match &cmdline.trim()[..] {
+		match cmdline.trim() {
 			"LIST" => dump_state = Some(serve_list(path::PathBuf::from("."))?),
 			"READ" => match &dump_state {
-				Some(state) => task::block_on(serve_read(path::PathBuf::from("."), &state))?,
+				Some(state) => task::block_on(serve_read(path::PathBuf::from("."), state))?,
 				None => {
 					println!("!Use LIST command first!");
 				}
 			},
 			"WRITE" => match &dump_state {
-				Some(state) => task::block_on(serve_write(path::PathBuf::from("."), &state))?,
+				Some(state) => task::block_on(serve_write(path::PathBuf::from("."), state))?,
 				None => {
 					println!("!Use LIST command first!");
 				}
 			},
 			"COMMIT" => match &dump_state {
-				Some(state) => task::block_on(serve_commit(path::PathBuf::from("."), &state))?,
+				Some(state) => task::block_on(serve_commit(path::PathBuf::from("."), state))?,
 				None => {
 					println!("!Use LIST command first!");
 				}

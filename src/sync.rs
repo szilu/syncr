@@ -1,8 +1,6 @@
-use async_process;
+use async_std::sync::Mutex;
 use async_std::{fs as afs, prelude::*};
 use futures::future;
-use serde_json;
-use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::io::{self, Read};
@@ -10,7 +8,7 @@ use std::{path, pin::Pin};
 use termios::{tcsetattr, Termios, ECHO, ICANON, TCSANOW};
 
 use crate::connect;
-use crate::types::{Config, FileData, FileType, HashChunk};
+use crate::types::{Config, FileData, FileType, HashChunk, PreviousSyncState};
 
 //////////
 // Sync //
@@ -26,7 +24,7 @@ impl TerminalGuard {
 	fn new() -> Result<Self, Box<dyn Error>> {
 		let fd = 0; // stdin
 		let original = Termios::from_fd(fd)?;
-		let mut new_termios = original.clone();
+		let mut new_termios = original;
 		new_termios.c_lflag &= !(ICANON | ECHO);
 		tcsetattr(fd, TCSANOW, &new_termios)?;
 		Ok(TerminalGuard { fd, original })
@@ -42,11 +40,11 @@ impl Drop for TerminalGuard {
 
 struct NodeState {
 	id: u8,
-	send: RefCell<async_process::ChildStdin>,
-	recv: RefCell<async_std::io::BufReader<async_process::ChildStdout>>,
+	send: Mutex<async_process::ChildStdin>,
+	recv: Mutex<async_std::io::BufReader<async_process::ChildStdout>>,
 	dir: BTreeMap<path::PathBuf, Box<FileData>>,
 	chunks: BTreeSet<String>,
-	missing: RefCell<BTreeSet<String>>,
+	missing: Mutex<BTreeSet<String>>,
 }
 
 impl PartialEq for NodeState {
@@ -57,10 +55,7 @@ impl PartialEq for NodeState {
 
 impl NodeState {
 	// Helper to safely parse protocol fields with validation
-	fn parse_protocol_line<'a>(
-		buf: &'a str,
-		expected_fields: usize,
-	) -> Result<Vec<&'a str>, Box<dyn Error>> {
+	fn parse_protocol_line(buf: &str, expected_fields: usize) -> Result<Vec<&str>, Box<dyn Error>> {
 		let fields: Vec<&str> = buf.trim().split(':').collect();
 		if fields.len() < expected_fields {
 			return Err(format!(
@@ -79,7 +74,7 @@ impl NodeState {
 			FileType::File => {
 				if trans_data {
 					writeln!(
-						self.send.borrow_mut(),
+						self.send.lock().await,
 						"FD:{}:{}:{}:{}:{}:{}:{}",
 						file.path.to_str().expect(""),
 						file.mode,
@@ -91,21 +86,21 @@ impl NodeState {
 					)
 					.await?;
 					for chunk in &file.chunks {
-						if self.chunks.get(&chunk.hash).is_none() {
+						if !self.chunks.contains(&chunk.hash) {
 							// Chunk needs transfer
 							writeln!(
-								self.send.borrow_mut(),
+								self.send.lock().await,
 								"RC:{}:{}:{}",
 								chunk.offset,
 								chunk.size,
 								chunk.hash
 							)
 							.await?;
-							self.missing.borrow_mut().insert(chunk.hash.clone());
+							self.missing.lock().await.insert(chunk.hash.clone());
 						} else {
 							// Chunk is available locally
 							writeln!(
-								self.send.borrow_mut(),
+								self.send.lock().await,
 								"LC:{}:{}:{}",
 								chunk.offset,
 								chunk.size,
@@ -114,10 +109,10 @@ impl NodeState {
 							.await?;
 						}
 					}
-					writeln!(self.send.borrow_mut(), ".").await?;
+					writeln!(self.send.lock().await, ".").await?;
 				} else {
 					writeln!(
-						self.send.borrow_mut(),
+						self.send.lock().await,
 						"FM:{}:{}:{}:{}:{}:{}:{}",
 						file.path.to_str().expect(""),
 						file.mode,
@@ -132,7 +127,7 @@ impl NodeState {
 			}
 			FileType::SymLink => {
 				writeln!(
-					self.send.borrow_mut(),
+					self.send.lock().await,
 					"L:{}:{}:{}:{}:{}:{}",
 					file.path.to_str().expect(""),
 					file.mode,
@@ -145,7 +140,7 @@ impl NodeState {
 			}
 			FileType::Dir => {
 				writeln!(
-					self.send.borrow_mut(),
+					self.send.lock().await,
 					"D:{}:{}:{}:{}:{}:{}",
 					file.path.to_str().expect(""),
 					file.mode,
@@ -161,7 +156,7 @@ impl NodeState {
 	}
 
 	async fn send(&self, buf: &str) -> Result<(), Box<dyn Error>> {
-		self.send.borrow_mut().write_all(&[&buf, &"\n"[..]].concat().as_bytes()).await?;
+		self.send.lock().await.write_all([buf, "\n"].concat().as_bytes()).await?;
 		Ok(())
 	}
 
@@ -171,17 +166,17 @@ impl NodeState {
 
 		loop {
 			buf.clear();
-			self.recv.get_mut().read_line(&mut buf).await?;
+			self.recv.lock().await.read_line(&mut buf).await?;
 			if buf.trim() == "." {
 				break;
 			}
 			//eprintln!("[{}]HDR: {}", self.id, buf.trim());
 		}
 
-		self.send.get_mut().write_all(b"LIST\n").await?;
+		self.send.lock().await.write_all(b"LIST\n").await?;
 		loop {
 			buf.clear();
-			self.recv.get_mut().read_line(&mut buf).await?;
+			self.recv.lock().await.read_line(&mut buf).await?;
 			if buf.trim() == "." {
 				break;
 			}
@@ -222,7 +217,7 @@ impl NodeState {
 				}
 				"C" => {
 					let fields = Self::parse_protocol_line(&buf, 4)?;
-					let hc = Box::new(HashChunk {
+					let hc = HashChunk {
 						hash: String::from(fields[3]),
 						offset: fields[1]
 							.parse()
@@ -230,7 +225,7 @@ impl NodeState {
 						size: fields[2]
 							.parse()
 							.map_err(|e| format!("Invalid size '{}': {}", fields[2], e))?,
-					});
+					};
 					match &mut file_data {
 						Some(data) => {
 							data.chunks.push(hc);
@@ -304,7 +299,7 @@ impl NodeState {
 }
 
 struct SyncState {
-	nodes: Vec<Box<NodeState>>,
+	nodes: Vec<NodeState>,
 	//tree: BTreeMap<path::PathBuf, u8>
 	//tree: BTreeMap<path::PathBuf, &FileData>
 }
@@ -315,14 +310,14 @@ impl SyncState {
 		send: async_process::ChildStdin,
 		recv: async_std::io::BufReader<async_process::ChildStdout>,
 	) {
-		let node = Box::new(NodeState {
+		let node = NodeState {
 			id: self.nodes.len() as u8 + 1,
-			send: RefCell::new(send),
-			recv: RefCell::new(recv),
+			send: Mutex::new(send),
+			recv: Mutex::new(recv),
 			dir: BTreeMap::new(),
 			chunks: BTreeSet::new(),
-			missing: RefCell::new(BTreeSet::new()),
-		});
+			missing: Mutex::new(BTreeSet::new()),
+		};
 		self.nodes.push(node);
 	}
 }
@@ -336,31 +331,53 @@ enum SyncOption<T> {
 
 impl<T> SyncOption<T> {
 	pub fn is_none(&self) -> bool {
-		match &self {
-			SyncOption::None => true,
-			_ => false,
-		}
+		matches!(self, SyncOption::None)
 	}
 
 	pub fn is_conflict(&self) -> bool {
-		match &self {
-			SyncOption::Conflict => true,
-			_ => false,
-		}
+		matches!(self, SyncOption::Conflict)
 	}
 
 	pub fn is_some(&self) -> bool {
-		match &self {
-			SyncOption::Some(_) => true,
-			_ => false,
-		}
+		matches!(self, SyncOption::Some(_))
 	}
+}
+
+// Load previous sync state from JSON file for three-way merge detection
+async fn load_previous_state(config: &Config) -> Result<Option<PreviousSyncState>, Box<dyn Error>> {
+	let state_file = config.syncr_dir.join(format!("{}.profile.json", config.profile));
+
+	// If file doesn't exist, this is the first sync
+	if !state_file.exists() {
+		return Ok(None);
+	}
+
+	// Try to read and parse the state
+	let contents = afs::read_to_string(&state_file).await?;
+	let file_map: BTreeMap<String, FileData> = serde_json::from_str(&contents)?;
+
+	// Get current timestamp
+	let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+
+	Ok(Some(PreviousSyncState { files: file_map, timestamp }))
 }
 
 pub async fn sync(config: Config, dirs: Vec<&str>) -> Result<(), Box<dyn Error>> {
 	let mut state = SyncState { nodes: Vec::new() };
 	//let mut tree: BTreeMap<path::PathBuf, u8> = BTreeMap::new();
 	let mut tree: BTreeMap<path::PathBuf, Box<FileData>> = BTreeMap::new();
+
+	// Load previous sync state for three-way merge detection
+	eprintln!("Loading previous state...");
+	let previous_state = load_previous_state(&config).await?;
+	if previous_state.is_some() {
+		eprintln!(
+			"Loaded previous state with {} files",
+			previous_state.as_ref().unwrap().files.len()
+		);
+	} else {
+		eprintln!("No previous state found (first sync)");
+	}
 
 	eprintln!("Initializing processes...");
 	for dir in dirs {
@@ -383,12 +400,13 @@ pub async fn sync(config: Config, dirs: Vec<&str>) -> Result<(), Box<dyn Error>>
 
 	let mut diff: BTreeMap<&path::Path, SyncOption<u8>> = BTreeMap::new();
 	for node in &state.nodes {
-		for (path, _) in &node.dir {
-			//let last = state.tree.get(path);
-			//eprintln!("kast {:?}", last);
-			let last: Option<&FileData> = None;
+		for path in node.dir.keys() {
+			// Get previous state for three-way merge
+			let prev_file = previous_state
+				.as_ref()
+				.and_then(|ps| ps.files.get(&path.to_string_lossy().to_string()));
 
-			diff.entry(&path).or_insert_with(|| {
+			diff.entry(path).or_insert_with(|| {
 				let mut files: Vec<Option<&Box<FileData>>> =
 					state.nodes.iter().map(|n| n.dir.get(path)).collect();
 				//let mut latest: Option<u8> = None;
@@ -398,20 +416,19 @@ pub async fn sync(config: Config, dirs: Vec<&str>) -> Result<(), Box<dyn Error>>
 				//eprintln!("File: {:?}", &path);
 				for (idx, file) in files.iter().enumerate() {
 					if let Some(f) = file {
-						//eprintln!("Node: {} {:?}", idx, last);
-						//eprintln!("         {:?}", f);
-						if let Some(last) = last {
-							if f.tp != last.tp
-								|| f.mode != last.mode || f.user != last.user
-								|| f.group != last.group || f.chunks != last.chunks
+						// Three-way merge: compare with previous state if available
+						if let Some(prev) = prev_file {
+							if f.tp != prev.tp
+								|| f.mode != prev.mode || f.user != prev.user
+								|| f.group != prev.group || f.chunks != prev.chunks
 							{
 								eprintln!(
-									"diff {} {} {} {} {}",
-									f.tp != last.tp,
-									f.mode != last.mode,
-									f.user != last.user,
-									f.group != last.group,
-									f.chunks != last.chunks
+									"diff {} {} {} {} {} (modified since last sync)",
+									f.tp != prev.tp,
+									f.mode != prev.mode,
+									f.user != prev.user,
+									f.group != prev.group,
+									f.chunks != prev.chunks
 								);
 								if winner.is_none() {
 									winner = SyncOption::Some(idx as u8);
@@ -420,6 +437,7 @@ pub async fn sync(config: Config, dirs: Vec<&str>) -> Result<(), Box<dyn Error>>
 								}
 							}
 						} else {
+							// No previous state - use old logic
 							if winner.is_none() {
 								winner = SyncOption::Some(idx as u8);
 							} else if let SyncOption::Some(win) = winner {
@@ -449,7 +467,8 @@ pub async fn sync(config: Config, dirs: Vec<&str>) -> Result<(), Box<dyn Error>>
 					}
 					loop {
 						eprint!("? ");
-						let keypress = io::stdin().bytes().next().unwrap();
+						let mut buf = [0; 1];
+						let keypress = io::stdin().read(&mut buf).map(|_| buf[0]);
 						if let Ok(key) = keypress {
 							eprintln!("{:?}", key);
 							if b'1' <= key && key <= b'0' + files.len() as u8 {
@@ -489,6 +508,24 @@ pub async fn sync(config: Config, dirs: Vec<&str>) -> Result<(), Box<dyn Error>>
 		}
 	}
 	//println!("DIFF: {:?}", diff);
+
+	// Detect deleted files: files that existed in previous sync but are missing from all nodes
+	let mut deleted_files: Vec<String> = Vec::new();
+	if let Some(prev_state) = &previous_state {
+		for prev_path in prev_state.files.keys() {
+			let path_buf = path::PathBuf::from(prev_path);
+			// Check if this file exists on any node
+			let exists_on_any_node =
+				state.nodes.iter().any(|node| node.dir.contains_key(&path_buf));
+
+			if !exists_on_any_node {
+				// File was in previous state but is missing from all nodes
+				eprintln!("File was deleted: {}", prev_path);
+				deleted_files.push(prev_path.clone());
+			}
+		}
+	}
+	eprintln!("Found {} deleted files", deleted_files.len());
 
 	// Terminal will be automatically restored by TerminalGuard when it goes out of scope
 
@@ -536,10 +573,18 @@ pub async fn sync(config: Config, dirs: Vec<&str>) -> Result<(), Box<dyn Error>>
 					}
 					if trans_meta {
 						let node = &state.nodes[idx];
-						node.write_file(&lfile, trans_data).await?;
+						node.write_file(lfile, trans_data).await?;
 					}
 				}
 			}
+		}
+	}
+
+	// Send delete commands for files that were deleted
+	eprintln!("Sending delete commands...");
+	for deleted_path in &deleted_files {
+		for node in &state.nodes {
+			node.send(&format!("DEL:{}", deleted_path)).await?;
 		}
 	}
 
@@ -551,11 +596,11 @@ pub async fn sync(config: Config, dirs: Vec<&str>) -> Result<(), Box<dyn Error>>
 		srcnode.send(".\nREAD").await?;
 		for dstnode in &state.nodes {
 			if dstnode != srcnode {
-				let missing = dstnode.missing.borrow_mut();
+				let missing = dstnode.missing.lock().await;
 				for chunk in missing.iter() {
-					if done.get(chunk).is_none() {
+					if !done.contains(chunk) {
 						//eprintln!("MISSING CHUNK: {} {:?}", chunk, srcnode.chunks.get(chunk));
-						if srcnode.chunks.get(chunk).is_some() {
+						if srcnode.chunks.contains(chunk) {
 							srcnode.send(chunk).await?;
 							done.insert(String::from(chunk));
 						}
@@ -564,27 +609,29 @@ pub async fn sync(config: Config, dirs: Vec<&str>) -> Result<(), Box<dyn Error>>
 			}
 		}
 		srcnode.send(".").await?;
-		let mut recv = srcnode.recv.borrow_mut();
 		let mut buf = String::new();
 		let mut chunk = String::new();
 		let mut chunkdata = String::new();
 		loop {
 			buf.clear();
-			recv.read_line(&mut buf).await?;
-			if chunk == "" && &buf[..2] == "C:" {
+			srcnode.recv.lock().await.read_line(&mut buf).await?;
+			if chunk.is_empty() && &buf[..2] == "C:" {
 				chunk.clear();
 				chunk.push_str(&buf.trim()[2..]);
 				chunkdata.clear();
-			} else if &chunk == "" && buf.trim() == "." {
+			} else if chunk.is_empty() && buf.trim() == "." {
 				break;
 			} else if buf.trim() == "." {
 				chunkdata.push('.');
 				let data = &["C:", &chunk, "\n", &chunkdata].join("");
 				for dstnode in &state.nodes {
-					if dstnode != srcnode && dstnode.missing.borrow().get(&chunk).is_some() {
-						// Send chunk
-						dstnode.send(&data).await?;
-						dstnode.missing.borrow_mut().remove(&chunk);
+					if dstnode != srcnode {
+						let mut missing = dstnode.missing.lock().await;
+						if missing.get(&chunk).is_some() {
+							// Send chunk
+							dstnode.send(data).await?;
+							missing.remove(&chunk);
+						}
 					}
 				}
 				chunk.clear();
@@ -607,7 +654,7 @@ pub async fn sync(config: Config, dirs: Vec<&str>) -> Result<(), Box<dyn Error>>
 		node.send("COMMIT").await?;
 		// Wait for response and check for errors
 		let mut buf = String::new();
-		node.recv.borrow_mut().read_line(&mut buf).await?;
+		node.recv.lock().await.read_line(&mut buf).await?;
 		let response = buf.trim();
 		if response.starts_with("ERROR:") {
 			return Err(format!("Node {} failed to commit: {}", node.id, response).into());
@@ -624,7 +671,7 @@ pub async fn sync(config: Config, dirs: Vec<&str>) -> Result<(), Box<dyn Error>>
 		let mut buf = String::new();
 		loop {
 			buf.clear();
-			let n = node.recv.borrow_mut().read_line(&mut buf).await?;
+			let n = node.recv.lock().await.read_line(&mut buf).await?;
 			if n == 0 || buf.trim() == "." {
 				break;
 			}

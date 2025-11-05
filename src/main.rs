@@ -25,7 +25,7 @@ fn init_syncr_dir() -> path::PathBuf {
 			match fs::metadata(&syncr_dir) {
 				Ok(meta) => {
 					if meta.is_dir() {
-						return syncr_dir;
+						syncr_dir
 					} else {
 						eprintln!(
 							"{} exists, but it is not a directory!",
@@ -39,7 +39,7 @@ fn init_syncr_dir() -> path::PathBuf {
 					if let Err(err) = fs::create_dir(&syncr_dir) {
 						panic!("Cannot create directory: {:?}", err);
 					}
-					return syncr_dir;
+					syncr_dir
 				}
 			}
 		}

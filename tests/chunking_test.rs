@@ -58,7 +58,7 @@ fn test_chunking_large_file() {
 	let chunks = chunk_data(&content);
 
 	// With varied content, should produce at least 1 chunk
-	assert!(chunks.len() >= 1, "Large file should produce at least one chunk");
+	assert!(!chunks.is_empty(), "Large file should produce at least one chunk");
 
 	// Verify all chunks are accounted for
 	let total_size: usize = chunks.iter().map(|(_, size)| size).sum();
@@ -112,7 +112,7 @@ fn test_chunking_binary_data() {
 	let content: Vec<u8> = (0..=255).cycle().take(50000).collect();
 	let chunks = chunk_data(&content);
 
-	assert!(chunks.len() > 0);
+	assert!(!chunks.is_empty());
 
 	// Verify total coverage
 	let total: usize = chunks.iter().map(|(_, s)| s).sum();
@@ -128,7 +128,7 @@ fn test_chunking_identical_blocks() {
 	let chunks = chunk_data(&content);
 
 	// Even with identical content, chunking should be consistent
-	assert!(chunks.len() > 0);
+	assert!(!chunks.is_empty());
 	let total: usize = chunks.iter().map(|(_, s)| s).sum();
 	assert_eq!(total, content.len());
 }
@@ -148,7 +148,7 @@ fn test_chunking_from_file() {
 	let read_content = fs::read(&file_path).unwrap();
 	let chunks = chunk_data(&read_content);
 
-	assert!(chunks.len() > 0);
+	assert!(!chunks.is_empty());
 	let total: usize = chunks.iter().map(|(_, s)| s).sum();
 	assert_eq!(total, read_content.len());
 }
@@ -210,8 +210,8 @@ fn test_chunking_reproduces_after_modification() {
 	let chunks2 = chunk_data(&content2);
 
 	// Both should have at least one chunk
-	assert!(chunks1.len() >= 1);
-	assert!(chunks2.len() >= 1);
+	assert!(!chunks1.is_empty());
+	assert!(!chunks2.is_empty());
 
 	// If both have multiple chunks, compare the stable portion
 	if chunks1.len() > 1 && chunks2.len() > 1 {

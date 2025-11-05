@@ -1,4 +1,6 @@
 use serde::ser::{Serialize, SerializeStruct, Serializer};
+use serde::{Deserialize, Serialize as SerdeSerialize};
+use std::collections::BTreeMap;
 use std::path;
 
 #[derive(Debug)]
@@ -7,28 +9,28 @@ pub struct Config {
 	pub profile: String,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct FileChunk {
 	pub path: path::PathBuf,
 	pub offset: u64,
 	pub size: usize,
 }
 
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug, SerdeSerialize, Deserialize)]
 pub struct HashChunk {
 	pub hash: String,
 	pub offset: u64,
 	pub size: usize,
 }
 
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug, SerdeSerialize, Deserialize)]
 pub enum FileType {
 	File,
 	Dir,
 	SymLink,
 }
 
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug, Deserialize)]
 pub struct FileData {
 	pub tp: FileType,
 	pub path: path::PathBuf,
@@ -38,7 +40,7 @@ pub struct FileData {
 	pub ctime: u32,
 	pub mtime: u32,
 	pub size: u64,
-	pub chunks: Vec<Box<HashChunk>>,
+	pub chunks: Vec<HashChunk>,
 }
 
 impl Serialize for FileData {
@@ -55,6 +57,24 @@ impl Serialize for FileData {
 		state.serialize_field("path", &self.path.to_str())?;
 		state.end()
 	}
+}
+
+/// File operation type for tracking changes across syncs
+#[allow(dead_code)]
+#[derive(Clone, PartialEq, Debug)]
+pub enum FileOperation {
+	Create,
+	Modify,
+	Delete,
+}
+
+/// State from a previous sync, used for three-way merge detection
+#[derive(Clone, Debug, SerdeSerialize, Deserialize)]
+pub struct PreviousSyncState {
+	/// Files that existed in the previous sync, keyed by path
+	pub files: BTreeMap<String, FileData>,
+	/// Timestamp of the previous sync
+	pub timestamp: u64,
 }
 
 #[cfg(test)]
@@ -105,8 +125,8 @@ mod test {
 
 	#[test]
 	fn test_file_data_with_chunks() {
-		let chunk1 = Box::new(HashChunk { hash: String::from("hash1"), offset: 0, size: 1024 });
-		let chunk2 = Box::new(HashChunk { hash: String::from("hash2"), offset: 1024, size: 512 });
+		let chunk1 = HashChunk { hash: String::from("hash1"), offset: 0, size: 1024 };
+		let chunk2 = HashChunk { hash: String::from("hash2"), offset: 1024, size: 512 };
 
 		let fd = FileData {
 			tp: FileType::File,
