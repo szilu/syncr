@@ -266,23 +266,20 @@ async fn test_sync_fails_with_empty_locations_list() {
 
 #[tokio::test]
 async fn test_sync_builder_with_single_location() {
-	// This should not fail validation (but will fail on actual sync since not implemented)
+	// This should not fail validation
 	let result = SyncBuilder::new().add_location("./test_dir").sync().await;
 
-	// Expected to fail because sync() is not implemented, not because of validation
+	// Expected to fail because ./test_dir doesn't exist, resulting in connection error
 	match result {
-		Err(SyncError::Other { message }) => {
-			assert!(message.contains("not yet implemented"));
-		}
 		Err(SyncError::InvalidConfig { message }) => {
 			panic!("Should not fail validation: {}", message);
 		}
 		Err(_) => {
-			// Other error types are acceptable as long as it's not InvalidConfig
-			// The key is that we passed validation
+			// Expected: connection or other error since directory doesn't exist
+			// The key is that validation passed
 		}
 		Ok(_) => {
-			panic!("Should fail with not-implemented error");
+			panic!("Should fail because ./test_dir doesn't exist");
 		}
 	}
 }

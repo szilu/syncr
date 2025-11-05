@@ -6,6 +6,7 @@ use crate::types::Config;
 
 mod config;
 mod connect;
+mod protocol_utils;
 mod serve;
 mod sync_impl; // Private sync implementation
 mod types;

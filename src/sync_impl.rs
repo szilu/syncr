@@ -10,6 +10,7 @@ use tokio::sync::Mutex;
 
 // Use the old connect module directly (not the new connection.rs library API)
 use crate::connect;
+use crate::protocol_utils;
 use crate::types::{Config, FileData, FileType, HashChunk, PreviousSyncState};
 
 //////////
@@ -70,6 +71,7 @@ async fn handshake(
 
 	// Send our protocol version
 	send.write_all(format!("VERSION:{}\n", PROTOCOL_VERSION).as_bytes()).await?;
+	send.flush().await?;
 
 	// Read remote protocol version
 	buf.clear();
@@ -139,22 +141,8 @@ impl PartialEq for NodeState {
 }
 
 impl NodeState {
-	// Helper to safely parse protocol fields with validation
-	fn parse_protocol_line(buf: &str, expected_fields: usize) -> Result<Vec<&str>, Box<dyn Error>> {
-		let fields: Vec<&str> = buf.trim().split(':').collect();
-		if fields.len() < expected_fields {
-			return Err(format!(
-				"Protocol error: expected {} fields, got {} in line: {}",
-				expected_fields,
-				fields.len(),
-				buf.trim()
-			)
-			.into());
-		}
-		Ok(fields)
-	}
-
 	async fn write_file(&self, file: &FileData, trans_data: bool) -> Result<(), Box<dyn Error>> {
+		let mut sender = self.send.lock().await;
 		match file.tp {
 			FileType::File => {
 				if trans_data {
@@ -168,28 +156,20 @@ impl NodeState {
 						file.mtime,
 						file.size
 					);
-					self.send.lock().await.write_all(format!("{}\n", msg).as_bytes()).await?;
+					sender.write_all(format!("{}\n", msg).as_bytes()).await?;
 					for chunk in &file.chunks {
 						if !self.chunks.contains(&chunk.hash) {
 							// Chunk needs transfer
 							let msg = format!("RC:{}:{}:{}", chunk.offset, chunk.size, chunk.hash);
-							self.send
-								.lock()
-								.await
-								.write_all(format!("{}\n", msg).as_bytes())
-								.await?;
+							sender.write_all(format!("{}\n", msg).as_bytes()).await?;
 							self.missing.lock().await.insert(chunk.hash.clone());
 						} else {
 							// Chunk is available locally
 							let msg = format!("LC:{}:{}:{}", chunk.offset, chunk.size, chunk.hash);
-							self.send
-								.lock()
-								.await
-								.write_all(format!("{}\n", msg).as_bytes())
-								.await?;
+							sender.write_all(format!("{}\n", msg).as_bytes()).await?;
 						}
 					}
-					self.send.lock().await.write_all(b".\n").await?;
+					sender.write_all(b".\n").await?;
 				} else {
 					let msg = format!(
 						"FM:{}:{}:{}:{}:{}:{}:{}",
@@ -201,7 +181,7 @@ impl NodeState {
 						file.mtime,
 						file.size
 					);
-					self.send.lock().await.write_all(format!("{}\n", msg).as_bytes()).await?;
+					sender.write_all(format!("{}\n", msg).as_bytes()).await?;
 				}
 			}
 			FileType::SymLink => {
@@ -214,7 +194,7 @@ impl NodeState {
 					file.ctime,
 					file.mtime
 				);
-				self.send.lock().await.write_all(format!("{}\n", msg).as_bytes()).await?;
+				sender.write_all(format!("{}\n", msg).as_bytes()).await?;
 			}
 			FileType::Dir => {
 				let msg = format!(
@@ -226,14 +206,17 @@ impl NodeState {
 					file.ctime,
 					file.mtime
 				);
-				self.send.lock().await.write_all(format!("{}\n", msg).as_bytes()).await?;
+				sender.write_all(format!("{}\n", msg).as_bytes()).await?;
 			}
 		}
+		sender.flush().await?;
 		Ok(())
 	}
 
 	async fn send(&self, buf: &str) -> Result<(), Box<dyn Error>> {
-		self.send.lock().await.write_all([buf, "\n"].concat().as_bytes()).await?;
+		let mut sender = self.send.lock().await;
+		sender.write_all([buf, "\n"].concat().as_bytes()).await?;
+		sender.flush().await?;
 		Ok(())
 	}
 
@@ -244,6 +227,7 @@ impl NodeState {
 		// Note: Handshake already consumed the initialization "." message,
 		// so we don't need to read it again here. Just send LIST directly.
 		self.send.lock().await.write_all(b"LIST\n").await?;
+		self.send.lock().await.flush().await?;
 		loop {
 			buf.clear();
 			self.recv.lock().await.read_line(&mut buf).await?;
@@ -252,12 +236,12 @@ impl NodeState {
 			}
 			//println!("[{}]LINE: {}", self.id, buf.trim());
 
-			let fields = Self::parse_protocol_line(&buf, 1)?;
+			let fields = protocol_utils::parse_protocol_line(&buf, 1)?;
 			let cmd = fields[0];
 
 			match cmd {
 				"F" => {
-					let fields = Self::parse_protocol_line(&buf, 8)?;
+					let fields = protocol_utils::parse_protocol_line(&buf, 8)?;
 					let path = path::PathBuf::from(fields[1]);
 					let fd = Box::new(FileData {
 						tp: FileType::File,
@@ -286,7 +270,7 @@ impl NodeState {
 					file_data = self.dir.get_mut(&path);
 				}
 				"C" => {
-					let fields = Self::parse_protocol_line(&buf, 4)?;
+					let fields = protocol_utils::parse_protocol_line(&buf, 4)?;
 					let hc = HashChunk {
 						hash: String::from(fields[3]),
 						offset: fields[1]
@@ -307,7 +291,7 @@ impl NodeState {
 					self.chunks.insert(String::from(fields[3]));
 				}
 				"L" => {
-					let fields = Self::parse_protocol_line(&buf, 7)?;
+					let fields = protocol_utils::parse_protocol_line(&buf, 7)?;
 					let path = path::PathBuf::from(fields[1]);
 					let fd = Box::new(FileData {
 						tp: FileType::SymLink,
@@ -334,7 +318,7 @@ impl NodeState {
 					file_data = self.dir.get_mut(&path);
 				}
 				"D" => {
-					let fields = Self::parse_protocol_line(&buf, 7)?;
+					let fields = protocol_utils::parse_protocol_line(&buf, 7)?;
 					let path = path::PathBuf::from(fields[1]);
 					let fd = Box::new(FileData {
 						tp: FileType::Dir,

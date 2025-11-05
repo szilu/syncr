@@ -11,6 +11,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 //use std::{thread, time};
 
 use crate::config;
+use crate::protocol_utils;
 use crate::types::{FileChunk, FileData, FileType, HashChunk};
 use crate::util;
 
@@ -73,21 +74,6 @@ pub struct DumpState {
 }
 
 impl DumpState {
-	// Helper to safely parse protocol fields with validation
-	fn parse_protocol_line(buf: &str, expected_fields: usize) -> Result<Vec<&str>, Box<dyn Error>> {
-		let fields: Vec<&str> = buf.trim().split(':').collect();
-		if fields.len() < expected_fields {
-			return Err(format!(
-				"Protocol error: expected {} fields, got {} in line: {}",
-				expected_fields,
-				fields.len(),
-				buf.trim()
-			)
-			.into());
-		}
-		Ok(fields)
-	}
-
 	fn add_chunk(&mut self, hash: String, path: path::PathBuf, offset: u64, size: usize) {
 		let v = self.chunks.entry(hash).or_default();
 		if !v.iter().any(|p| p.path == path) {
@@ -303,13 +289,13 @@ async fn serve_write(dir: path::PathBuf, dump_state: &DumpState) -> Result<(), B
 		buf.clear();
 		io::stdin().read_line(&mut buf)?;
 
-		let fields = DumpState::parse_protocol_line(&buf, 1)?;
+		let fields = protocol_utils::parse_protocol_line(&buf, 1)?;
 		let cmd = fields[0];
 
 		match cmd {
 			"DEL" => {
 				// Delete command: remove file from node
-				let fields = DumpState::parse_protocol_line(&buf, 2)?;
+				let fields = protocol_utils::parse_protocol_line(&buf, 2)?;
 				let path = path::PathBuf::from(fields[1]);
 
 				// Validate path to prevent directory traversal attacks
@@ -327,7 +313,7 @@ async fn serve_write(dir: path::PathBuf, dump_state: &DumpState) -> Result<(), B
 				}
 			}
 			"FM" | "FD" => {
-				let fields = DumpState::parse_protocol_line(&buf, 8)?;
+				let fields = protocol_utils::parse_protocol_line(&buf, 8)?;
 				let path = path::PathBuf::from(fields[1]);
 
 				// Validate path to prevent directory traversal attacks
@@ -370,7 +356,7 @@ async fn serve_write(dir: path::PathBuf, dump_state: &DumpState) -> Result<(), B
 				}
 			}
 			"D" => {
-				let fields = DumpState::parse_protocol_line(&buf, 7)?;
+				let fields = protocol_utils::parse_protocol_line(&buf, 7)?;
 				let path = path::PathBuf::from(fields[1]);
 				let fd = Box::new(FileData {
 					tp: FileType::Dir,
@@ -404,7 +390,7 @@ async fn serve_write(dir: path::PathBuf, dump_state: &DumpState) -> Result<(), B
 				dump_state.rename.borrow_mut().insert(filepath.clone(), path.clone());
 			}
 			"LC" | "RC" => {
-				let fields = DumpState::parse_protocol_line(&buf, 4)?;
+				let fields = protocol_utils::parse_protocol_line(&buf, 4)?;
 				if file.is_none() {
 					return Err("Protocol error: chunk command without file".into());
 				}
@@ -442,7 +428,7 @@ async fn serve_write(dir: path::PathBuf, dump_state: &DumpState) -> Result<(), B
 				}
 			}
 			"C" => {
-				let fields = DumpState::parse_protocol_line(&buf, 2)?;
+				let fields = protocol_utils::parse_protocol_line(&buf, 2)?;
 				let mut buf = String::new();
 				let hash = fields[1];
 				let mut chunk: Vec<u8> = Vec::new();

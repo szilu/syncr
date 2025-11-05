@@ -39,6 +39,7 @@ pub mod config;
 pub mod conflict;
 pub mod connection;
 pub mod error;
+pub mod protocol_utils;
 pub mod state;
 pub mod sync;
 pub mod types;
