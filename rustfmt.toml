@@ -1,0 +1,24 @@
+# Core formatting
+edition = "2021"
+max_width = 100
+hard_tabs = true
+tab_spaces = 4
+newline_style = "Unix"
+
+# Allow more code to fit on single lines
+use_small_heuristics = "Max"
+array_width = 80
+chain_width = 80
+#fn_single_line = true
+
+# Import organization
+reorder_imports = true
+#imports_granularity = "Crate"
+#group_imports = "StdExternalCrate"
+
+# Use modern Rust idioms
+use_field_init_shorthand = true
+use_try_shorthand = true
+
+# Chain formatting
+#overflow_delimited_expr = true
