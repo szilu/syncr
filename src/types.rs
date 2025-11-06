@@ -141,6 +141,7 @@ pub struct FileData {
 	pub mtime: u32,
 	pub size: u64,
 	pub chunks: Vec<HashChunk>,
+	pub target: Option<path::PathBuf>,
 }
 
 impl Serialize for FileData {
@@ -216,6 +217,7 @@ mod test {
 			mtime: 1234567890,
 			size: 4096,
 			chunks: vec![],
+			target: None,
 		};
 		assert_eq!(fd.tp, FileType::File);
 		assert_eq!(fd.mode, 0o644);
@@ -238,6 +240,7 @@ mod test {
 			mtime: 1234567890,
 			size: 1536,
 			chunks: vec![chunk1, chunk2],
+			target: None,
 		};
 
 		assert_eq!(fd.chunks.len(), 2);
@@ -258,6 +261,7 @@ mod test {
 			mtime: 1234567890,
 			size: 1024,
 			chunks: vec![],
+			target: None,
 		};
 
 		let fd2 = FileData {
@@ -270,6 +274,7 @@ mod test {
 			mtime: 1234567890,
 			size: 1024,
 			chunks: vec![],
+			target: None,
 		};
 
 		assert_eq!(fd1, fd2);
@@ -283,6 +288,106 @@ mod test {
 		};
 		assert_eq!(config.syncr_dir, path::PathBuf::from("/home/user/.syncr"));
 		assert_eq!(config.profile, "test");
+	}
+
+	#[test]
+	fn test_symlink_data_creation() {
+		let fd = FileData {
+			tp: FileType::SymLink,
+			path: path::PathBuf::from("link"),
+			mode: 0o777,
+			user: 1000,
+			group: 1000,
+			ctime: 1234567890,
+			mtime: 1234567890,
+			size: 0,
+			chunks: vec![],
+			target: Some(path::PathBuf::from("target")),
+		};
+		assert_eq!(fd.tp, FileType::SymLink);
+		assert_eq!(fd.size, 0);
+		assert_eq!(fd.target, Some(path::PathBuf::from("target")));
+		assert_eq!(fd.chunks.len(), 0);
+	}
+
+	#[test]
+	fn test_symlink_data_without_target() {
+		let fd = FileData {
+			tp: FileType::SymLink,
+			path: path::PathBuf::from("link"),
+			mode: 0o777,
+			user: 1000,
+			group: 1000,
+			ctime: 1234567890,
+			mtime: 1234567890,
+			size: 0,
+			chunks: vec![],
+			target: None,
+		};
+		assert_eq!(fd.tp, FileType::SymLink);
+		assert_eq!(fd.target, None);
+	}
+
+	#[test]
+	fn test_symlink_data_equality() {
+		let fd1 = FileData {
+			tp: FileType::SymLink,
+			path: path::PathBuf::from("link"),
+			mode: 0o777,
+			user: 1000,
+			group: 1000,
+			ctime: 1234567890,
+			mtime: 1234567890,
+			size: 0,
+			chunks: vec![],
+			target: Some(path::PathBuf::from("target")),
+		};
+
+		let fd2 = FileData {
+			tp: FileType::SymLink,
+			path: path::PathBuf::from("link"),
+			mode: 0o777,
+			user: 1000,
+			group: 1000,
+			ctime: 1234567890,
+			mtime: 1234567890,
+			size: 0,
+			chunks: vec![],
+			target: Some(path::PathBuf::from("target")),
+		};
+
+		assert_eq!(fd1, fd2);
+	}
+
+	#[test]
+	fn test_symlink_data_inequality() {
+		let fd1 = FileData {
+			tp: FileType::SymLink,
+			path: path::PathBuf::from("link"),
+			mode: 0o777,
+			user: 1000,
+			group: 1000,
+			ctime: 1234567890,
+			mtime: 1234567890,
+			size: 0,
+			chunks: vec![],
+			target: Some(path::PathBuf::from("target1")),
+		};
+
+		let fd2 = FileData {
+			tp: FileType::SymLink,
+			path: path::PathBuf::from("link"),
+			mode: 0o777,
+			user: 1000,
+			group: 1000,
+			ctime: 1234567890,
+			mtime: 1234567890,
+			size: 0,
+			chunks: vec![],
+			target: Some(path::PathBuf::from("target2")),
+		};
+
+		assert_ne!(fd1, fd2);
 	}
 }
 

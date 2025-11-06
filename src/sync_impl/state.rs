@@ -77,16 +77,31 @@ impl NodeState {
 				}
 			}
 			FileType::SymLink => {
+				let target = file
+					.target
+					.as_ref()
+					.map(|p| p.to_string_lossy().to_string())
+					.unwrap_or_default();
 				let msg = format!(
-					"L:{}:{}:{}:{}:{}:{}",
+					"L:{}:{}:{}:{}:{}:{}:{}",
 					file.path.to_string_lossy(),
 					file.mode,
 					file.user,
 					file.group,
 					file.ctime,
-					file.mtime
+					file.mtime,
+					target
 				);
-				sender.write_all(format!("{}\n", msg).as_bytes()).await?;
+				sender
+					.write_all(
+						format!(
+							"{}
+",
+							msg
+						)
+						.as_bytes(),
+					)
+					.await?;
 			}
 			FileType::Dir => {
 				let msg = format!(

@@ -22,6 +22,7 @@ pub fn parse_file_metadata(buf: &str) -> Result<Box<FileData>, Box<dyn Error>> {
 		mtime: fields[6].parse().map_err(|e| format!("Invalid mtime '{}': {}", fields[6], e))?,
 		size: fields[7].parse().map_err(|e| format!("Invalid size '{}': {}", fields[7], e))?,
 		chunks: vec![],
+		target: None,
 	});
 
 	Ok(fd)
@@ -45,18 +46,20 @@ pub fn parse_dir_metadata(buf: &str) -> Result<Box<FileData>, Box<dyn Error>> {
 		mtime: fields[6].parse().map_err(|e| format!("Invalid mtime '{}': {}", fields[6], e))?,
 		size: 0,
 		chunks: vec![],
+		target: None,
 	});
 
 	Ok(fd)
 }
 
 /// Parse symlink metadata from L: protocol line
-/// Format: L:path:mode:user:group:ctime:mtime
+/// Format: L:path:mode:user:group:ctime:mtime:target
 /// Returns: FileData with FileType::SymLink and size=0
 #[allow(dead_code)]
 pub fn parse_symlink_metadata(buf: &str) -> Result<Box<FileData>, Box<dyn Error>> {
-	let fields = protocol_utils::parse_protocol_line(buf, 7)?;
+	let fields = protocol_utils::parse_protocol_line(buf, 8)?;
 	let path = path::PathBuf::from(fields[1]);
+	let target = if fields[7].is_empty() { None } else { Some(path::PathBuf::from(fields[7])) };
 
 	let fd = Box::new(FileData {
 		tp: FileType::SymLink,
@@ -68,6 +71,7 @@ pub fn parse_symlink_metadata(buf: &str) -> Result<Box<FileData>, Box<dyn Error>
 		mtime: fields[6].parse().map_err(|e| format!("Invalid mtime '{}': {}", fields[6], e))?,
 		size: 0,
 		chunks: vec![],
+		target,
 	});
 
 	Ok(fd)
@@ -110,6 +114,88 @@ pub fn parse_file_chunk_metadata(
 	};
 
 	Ok(fc)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn test_parse_symlink_metadata_with_target() {
+		let buf = "L:link:511:1000:1000:1234567890:1234567890:target";
+		let result = parse_symlink_metadata(buf);
+		assert!(result.is_ok());
+
+		let fd = result.unwrap();
+		assert_eq!(fd.tp, FileType::SymLink);
+		assert_eq!(fd.path, path::PathBuf::from("link"));
+		assert_eq!(fd.mode, 511); // 0o777 in decimal
+		assert_eq!(fd.user, 1000);
+		assert_eq!(fd.group, 1000);
+		assert_eq!(fd.ctime, 1234567890);
+		assert_eq!(fd.mtime, 1234567890);
+		assert_eq!(fd.size, 0);
+		assert_eq!(fd.target, Some(path::PathBuf::from("target")));
+		assert_eq!(fd.chunks.len(), 0);
+	}
+
+	#[test]
+	fn test_parse_symlink_metadata_without_target() {
+		let buf = "L:link:511:1000:1000:1234567890:1234567890:";
+		let result = parse_symlink_metadata(buf);
+		assert!(result.is_ok());
+
+		let fd = result.unwrap();
+		assert_eq!(fd.tp, FileType::SymLink);
+		assert_eq!(fd.path, path::PathBuf::from("link"));
+		assert_eq!(fd.target, None);
+	}
+
+	#[test]
+	fn test_parse_symlink_metadata_relative_target() {
+		let buf = "L:link:511:1000:1000:1234567890:1234567890:../target";
+		let result = parse_symlink_metadata(buf);
+		assert!(result.is_ok());
+
+		let fd = result.unwrap();
+		assert_eq!(fd.target, Some(path::PathBuf::from("../target")));
+	}
+
+	#[test]
+	fn test_parse_symlink_metadata_absolute_target() {
+		let buf = "L:link:511:1000:1000:1234567890:1234567890:/etc/config";
+		let result = parse_symlink_metadata(buf);
+		assert!(result.is_ok());
+
+		let fd = result.unwrap();
+		assert_eq!(fd.target, Some(path::PathBuf::from("/etc/config")));
+	}
+
+	#[test]
+	fn test_parse_file_metadata() {
+		let buf = "F:file.txt:420:1000:1000:1234567890:1234567890:1024";
+		let result = parse_file_metadata(buf);
+		assert!(result.is_ok());
+
+		let fd = result.unwrap();
+		assert_eq!(fd.tp, FileType::File);
+		assert_eq!(fd.path, path::PathBuf::from("file.txt"));
+		assert_eq!(fd.size, 1024);
+		assert_eq!(fd.target, None);
+	}
+
+	#[test]
+	fn test_parse_dir_metadata() {
+		let buf = "D:mydir:493:1000:1000:1234567890:1234567890";
+		let result = parse_dir_metadata(buf);
+		assert!(result.is_ok());
+
+		let fd = result.unwrap();
+		assert_eq!(fd.tp, FileType::Dir);
+		assert_eq!(fd.path, path::PathBuf::from("mydir"));
+		assert_eq!(fd.size, 0);
+		assert_eq!(fd.target, None);
+	}
 }
 
 // vim: ts=4

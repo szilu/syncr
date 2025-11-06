@@ -124,6 +124,7 @@ mod tests {
 			mtime,
 			size,
 			chunks: vec![],
+			target: None,
 		}
 	}
 

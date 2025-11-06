@@ -242,14 +242,19 @@ fn traverse_dir<'a>(state: &'a mut DumpState, dir: path::PathBuf) -> BoxedAsyncR
 				}
 			}
 			if meta.file_type().is_symlink() {
+				let target = match fs::read_link(&path) {
+					Ok(target_path) => target_path.to_string_lossy().to_string(),
+					Err(_) => String::new(),
+				};
 				protocol_println!(
-					"L:{}:{}:{}:{}:{}:{}",
+					"L:{}:{}:{}:{}:{}:{}:{}",
 					&path.to_string_lossy(),
 					meta.mode(),
 					meta.uid(),
 					meta.gid(),
 					meta.ctime(),
-					meta.mtime()
+					meta.mtime(),
+					target
 				);
 			}
 			if meta.is_dir() {
@@ -355,12 +360,24 @@ async fn serve_write(dir: path::PathBuf, dump_state: &DumpState) -> Result<(), B
 				}
 			}
 			"L" => {
-				// Symlink command - currently not fully supported
-				// Just parse and ignore to prevent protocol errors
-				let fields = protocol_utils::parse_protocol_line(&buf, 7)?;
-				let path = path::PathBuf::from(fields[1]);
+				// Symlink command: create a symlink
+				let fd = metadata_utils::parse_symlink_metadata(&buf)?;
+				let path = fd.path.clone();
 				validate_path(&path)?;
-				warn!("SYMLINK skipped (not yet supported): {:?}", &path);
+
+				// Remove existing file if it exists
+				if afs::metadata(&path).await.is_ok() {
+					afs::remove_file(&path).await.ok();
+				}
+
+				// Create the symlink with the target
+				if let Some(target) = &fd.target {
+					if let Err(e) = afs::symlink(target, &path).await {
+						error!("Failed to create symlink {:?} -> {:?}: {}", path, target, e);
+					}
+				} else {
+					warn!("Symlink {:?} has no target", path);
+				}
 			}
 			"FM" | "FD" => {
 				let fd = metadata_utils::parse_file_metadata(&buf)?;
