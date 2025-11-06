@@ -32,3 +32,5 @@ pub fn parse_protocol_line(buf: &str, expected_fields: usize) -> Result<Vec<&str
 	}
 	Ok(fields)
 }
+
+// vim: ts=4

@@ -62,3 +62,5 @@ mod test {
 		assert_ne!(res1, res2, "Different inputs should produce different hashes");
 	}
 }
+
+// vim: ts=4

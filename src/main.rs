@@ -5,16 +5,23 @@ use std::{env, fs, path};
 use crate::types::Config;
 
 mod config;
+mod conflict;
 mod connect;
 mod logging;
 mod metadata_utils;
+mod progress;
 mod protocol_utils;
 mod serve;
-mod sync_impl; // Private sync implementation
+pub mod sync_impl; // Sync implementation (types are public for callbacks)
 mod types;
 mod util;
+mod utils;
 
 use logging::*;
+
+// TUI module (only compiled with 'tui' feature)
+#[cfg(feature = "tui")]
+mod tui;
 
 ///////////////////////
 // Utility functions //
@@ -74,7 +81,33 @@ async fn main() -> Result<(), Box<dyn Error>> {
 		.subcommand(
 			Command::new("sync")
 				.about("Sync directories")
-				.arg(Arg::new("dir").required(true).action(ArgAction::Append).num_args(1..)),
+				.arg(Arg::new("dir").required(true).action(ArgAction::Append).num_args(1..))
+				.arg(
+					Arg::new("tui")
+						.long("tui")
+						.help("Use terminal UI (requires 'tui' feature)")
+						.action(ArgAction::SetTrue),
+				)
+				.arg(
+					Arg::new("progress")
+						.short('p')
+						.long("progress")
+						.help("Show progress display during sync")
+						.action(ArgAction::SetTrue),
+				)
+				.arg(
+					Arg::new("quiet")
+						.short('q')
+						.long("quiet")
+						.help("Suppress all output (no progress, minimal logs)")
+						.action(ArgAction::SetTrue),
+				)
+				.arg(
+					Arg::new("skip-conflicts")
+						.long("skip-conflicts")
+						.help("Skip conflicts instead of prompting for resolution")
+						.action(ArgAction::SetTrue),
+				),
 		)
 		.get_matches();
 
@@ -94,8 +127,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
 			info!("{}: {:?}", h, p);
 		}
 	} else if let Some(sub_matches) = matches.subcommand_matches("sync") {
-		// Sync mode: use standard tracing for stderr output
-		logging::init_tracing();
 		let config = Config {
 			syncr_dir: init_syncr_dir()?,
 			profile: matches
@@ -110,7 +141,49 @@ async fn main() -> Result<(), Box<dyn Error>> {
 			.ok_or("sync: at least one directory argument required")?
 			.map(|s| s.as_str())
 			.collect();
-		let _ = sync_impl::sync(config, dirs).await;
+
+		// Check if TUI mode requested
+		#[cfg(feature = "tui")]
+		if sub_matches.get_flag("tui") {
+			// TUI mode: Tracing will be initialized inside run_tui with broadcast channel
+			return tui::run_tui(config, dirs).await;
+		}
+
+		#[cfg(not(feature = "tui"))]
+		if sub_matches.get_flag("tui") {
+			eprintln!("TUI not available. Rebuild with: cargo build --features tui");
+			return Err("TUI support not compiled".into());
+		}
+
+		// CLI sync mode: determine sync behavior based on flags
+		let show_progress = sub_matches.get_flag("progress");
+		let quiet = sub_matches.get_flag("quiet");
+		let skip_conflicts = sub_matches.get_flag("skip-conflicts");
+
+		// Initialize logging (unless quiet mode)
+		if !quiet {
+			logging::init_tracing();
+		}
+
+		// Select sync mode based on flag combination
+		// Note: quiet mode suppresses everything
+		if quiet {
+			// Quiet mode: no output, skip conflicts
+			sync_impl::sync(config, dirs).await?;
+		} else if show_progress && skip_conflicts {
+			// Progress display, but skip conflicts
+			sync_impl::sync_with_cli_progress(config, dirs).await?;
+		} else if show_progress && !skip_conflicts {
+			// Progress display with interactive conflict resolution
+			sync_impl::sync_with_progress_and_conflicts(config, dirs).await?;
+		} else if !show_progress && skip_conflicts {
+			// No progress, skip conflicts
+			sync_impl::sync(config, dirs).await?;
+		} else {
+			// Default mode: interactive conflict resolution, no progress display
+			// (will still show logs if verbosity is set)
+			sync_impl::sync_with_conflicts(config, dirs).await?;
+		}
 	}
 
 	Ok(())

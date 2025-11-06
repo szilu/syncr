@@ -26,16 +26,28 @@ pub async fn connect(dir: &str) -> Result<Connect, Box<dyn Error>> {
 			.spawn()
 			.map_err(|e| format!("Failed to spawn SSH subprocess for {}:{}: {}", host, path, e))?;
 	} else {
-		child = tokio::process::Command::new("syncr")
+		// For local subprocess, use the absolute path to the current binary
+		let exe_path = std::env::current_exe()
+			.map_err(|e| format!("Failed to determine current executable path: {}", e))?;
+		child = tokio::process::Command::new(&exe_path)
 			.arg("serve")
 			.arg(dir)
 			.stdin(Stdio::piped())
 			.stdout(Stdio::piped())
 			.spawn()
-			.map_err(|e| format!("Failed to spawn local subprocess for {}: {}", dir, e))?;
+			.map_err(|e| {
+				format!(
+					"Failed to spawn local subprocess for {} using {}: {}",
+					dir,
+					exe_path.display(),
+					e
+				)
+			})?;
 	}
 	let send = child.stdin.take().ok_or("Failed to acquire stdin from subprocess")?;
 	let recv =
 		BufReader::new(child.stdout.take().ok_or("Failed to acquire stdout from subprocess")?);
 	Ok(Connect { send, recv })
 }
+
+// vim: ts=4

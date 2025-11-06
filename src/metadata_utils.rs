@@ -111,3 +111,5 @@ pub fn parse_file_chunk_metadata(
 
 	Ok(fc)
 }
+
+// vim: ts=4

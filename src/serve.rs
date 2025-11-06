@@ -3,7 +3,6 @@ use rollsum::Bup;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::error::Error;
-use std::io::Write;
 use std::os::unix::{fs::MetadataExt, prelude::PermissionsExt};
 use std::{env, fs, io, path, pin::Pin};
 use tokio::fs as afs;
@@ -25,9 +24,49 @@ const PROTOCOL_VERSION: u8 = 1;
 type BoxedAsyncResult<'a> =
 	Pin<Box<dyn std::future::Future<Output = Result<(), Box<dyn Error>>> + 'a>>;
 
+/// Macro for resilient protocol output - ignores broken pipe errors
+/// This prevents child processes from panicking when parent closes the pipe
+macro_rules! protocol_println {
+	($($arg:tt)*) => {{
+		use std::io::Write;
+		let result = writeln!(std::io::stdout(), $($arg)*);
+		match result {
+			Ok(_) => {
+				// Flush to ensure message is sent immediately
+				let _ = std::io::stdout().flush();
+			}
+			Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+				// Parent closed pipe or not reading yet - silently ignore
+				// Child will be stopped via QUIT command
+			}
+			Err(e) => {
+				// Other errors - continue but log to stderr
+				eprintln!("Protocol write error: {}", e);
+			}
+		}
+	}};
+}
+
 ///////////
 // Utils //
 ///////////
+
+/// Helper function for resilient stdout writes
+fn write_stdout(data: &[u8]) -> io::Result<()> {
+	use std::io::Write;
+	let mut stdout = io::stdout();
+	match stdout.write_all(data) {
+		Ok(()) => {
+			stdout.flush()?;
+			Ok(())
+		}
+		Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
+			// Parent closed pipe or not reading yet - pretend success
+			Ok(())
+		}
+		Err(e) => Err(e),
+	}
+}
 
 /// Validate that a path is safe to use (prevents directory traversal/injection attacks)
 /// Only allows relative paths without parent directory references
@@ -156,7 +195,7 @@ fn traverse_dir<'a>(state: &'a mut DumpState, dir: path::PathBuf) -> BoxedAsyncR
 			let meta = fs::symlink_metadata(&path)?;
 
 			if meta.is_file() {
-				println!(
+				protocol_println!(
 					"F:{}:{}:{}:{}:{}:{}:{}",
 					&path.to_string_lossy(),
 					meta.mode(),
@@ -182,7 +221,7 @@ fn traverse_dir<'a>(state: &'a mut DumpState, dir: path::PathBuf) -> BoxedAsyncR
 					}
 					if let Some((count, _hash)) = bup.find_chunk_edge(&buf[..endofs]) {
 						let h = util::hash(&buf[..count]);
-						println!("C:{}:{}:{}", offset, count, &h);
+						protocol_println!("C:{}:{}:{}", offset, count, &h);
 						//state.chunks.insert(h, path.clone());
 						state.add_chunk(h, path.clone(), offset, count);
 						unsafe {
@@ -193,7 +232,7 @@ fn traverse_dir<'a>(state: &'a mut DumpState, dir: path::PathBuf) -> BoxedAsyncR
 					} else {
 						let count = endofs;
 						let h = util::hash(&buf[..count]);
-						println!("C:{}:{}:{}", offset, count, &h);
+						protocol_println!("C:{}:{}:{}", offset, count, &h);
 						//state.chunks.insert(h, path.clone());
 						state.add_chunk(h, path.clone(), offset, count);
 						offset += count as u64;
@@ -203,7 +242,7 @@ fn traverse_dir<'a>(state: &'a mut DumpState, dir: path::PathBuf) -> BoxedAsyncR
 				}
 			}
 			if meta.file_type().is_symlink() {
-				println!(
+				protocol_println!(
 					"L:{}:{}:{}:{}:{}:{}",
 					&path.to_string_lossy(),
 					meta.mode(),
@@ -214,7 +253,7 @@ fn traverse_dir<'a>(state: &'a mut DumpState, dir: path::PathBuf) -> BoxedAsyncR
 				);
 			}
 			if meta.is_dir() {
-				println!(
+				protocol_println!(
 					"D:{}:{}:{}:{}:{}:{}",
 					&path.to_string_lossy(),
 					meta.mode(),
@@ -223,7 +262,7 @@ fn traverse_dir<'a>(state: &'a mut DumpState, dir: path::PathBuf) -> BoxedAsyncR
 					meta.ctime(),
 					meta.mtime()
 				);
-				//println!("D:{}:{}:{}", path.to_str().unwrap(), meta.uid(), meta.gid());
+				//protocol_println!("D:{}:{}:{}", path.to_str().unwrap(), meta.uid(), meta.gid());
 				traverse_dir(state, path).await?
 			}
 		}
@@ -242,7 +281,7 @@ pub fn serve_list(dir: path::PathBuf) -> Result<DumpState, Box<dyn Error>> {
 		tokio::runtime::Handle::current().block_on(traverse_dir(&mut state, dir))
 	})?;
 
-	println!(".");
+	protocol_println!(".");
 	Ok(state)
 }
 
@@ -271,15 +310,15 @@ async fn serve_read(dir: path::PathBuf, dump_state: &DumpState) -> Result<(), Bo
 			f.seek(io::SeekFrom::Start(fc.offset)).await?;
 			f.read_exact(&mut buf).await?;
 			let encoded = general_purpose::STANDARD.encode(buf);
-			println!("C:{}", chunk);
+			protocol_println!("C:{}", chunk);
 			for line in encoded.into_bytes().chunks(config::BASE64_LINE_LENGTH) {
-				io::stdout().write_all(line)?;
-				io::stdout().write_all(b"\n")?;
+				write_stdout(line)?;
+				write_stdout(b"\n")?;
 			}
-			println!(".");
+			protocol_println!(".");
 		}
 	}
-	println!(".");
+	protocol_println!(".");
 	Ok(())
 }
 
@@ -315,6 +354,14 @@ async fn serve_write(dir: path::PathBuf, dump_state: &DumpState) -> Result<(), B
 					}
 				}
 			}
+			"L" => {
+				// Symlink command - currently not fully supported
+				// Just parse and ignore to prevent protocol errors
+				let fields = protocol_utils::parse_protocol_line(&buf, 7)?;
+				let path = path::PathBuf::from(fields[1]);
+				validate_path(&path)?;
+				warn!("SYMLINK skipped (not yet supported): {:?}", &path);
+			}
 			"FM" | "FD" => {
 				let fd = metadata_utils::parse_file_metadata(&buf)?;
 				let path = fd.path.clone();
@@ -343,7 +390,14 @@ async fn serve_write(dir: path::PathBuf, dump_state: &DumpState) -> Result<(), B
 				//filename.push(".SyNcR-TmP");
 				filepath.set_file_name(filename);
 				debug!("MKDIR {:?}", &filepath);
-				afs::create_dir(&filepath).await?;
+				// Try to create directory, but ignore AlreadyExists error
+				match afs::create_dir(&filepath).await {
+					Ok(_) => {}
+					Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+						debug!("Directory already exists: {:?}", &filepath);
+					}
+					Err(e) => return Err(e.into()),
+				}
 				afs::set_permissions(&filepath, std::fs::Permissions::from_mode(fd.mode)).await?;
 				dump_state.rename.borrow_mut().insert(filepath.clone(), path.clone());
 			}
@@ -368,7 +422,7 @@ async fn serve_write(dir: path::PathBuf, dump_state: &DumpState) -> Result<(), B
 						.await?
 						.ok_or_else(|| format!("Chunk not found: {}", fields[3]))?;
 					if let Err(e) = dump_state.write_chunk(&filepath, &hc, &buf).await {
-						println!("ERROR {}", e);
+						protocol_println!("ERROR {}", e);
 					}
 				} else {
 					// Remote chunk, add to wait list
@@ -429,7 +483,7 @@ async fn serve_write(dir: path::PathBuf, dump_state: &DumpState) -> Result<(), B
 			_ => return Err(format!("Unknown command: {}", cmd).into()),
 		}
 	}
-	println!("OK");
+	protocol_println!("OK");
 	Ok(())
 }
 
@@ -445,7 +499,7 @@ async fn serve_commit(
 			for hash in &missing_hashes {
 				error!("  Missing chunk: {}", hash);
 			}
-			println!("ERROR:Cannot commit with {} missing chunks", missing.len());
+			protocol_println!("ERROR:Cannot commit with {} missing chunks", missing.len());
 			return Err(format!("Cannot commit: {} chunks still missing", missing.len()).into());
 		}
 	}
@@ -460,7 +514,7 @@ async fn serve_commit(
 		afs::rename(&src, &dst).await?;
 		//fs::rename(&src, &dst)?;
 	}
-	println!("OK");
+	protocol_println!("OK");
 	Ok(())
 }
 
@@ -480,12 +534,22 @@ fn cleanup_temp_files(dir: &path::Path) -> Result<(), Box<dyn Error>> {
 				if let Some(name_str) = name.to_str() {
 					if name_str.ends_with(".SyNcR-TmP") {
 						debug!("Removing orphaned temp file: {:?}", path);
-						if metadata.is_file() {
-							fs::remove_file(&path)?;
+						let remove_result = if metadata.is_file() {
+							fs::remove_file(&path)
 						} else if metadata.is_dir() {
-							fs::remove_dir_all(&path)?;
+							fs::remove_dir_all(&path)
+						} else {
+							Ok(())
+						};
+
+						// Ignore "not found" errors - file may have been deleted already
+						match remove_result {
+							Ok(_) => *count += 1,
+							Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+								debug!("Temp file already removed: {:?}", path);
+							}
+							Err(e) => return Err(e.into()),
 						}
-						*count += 1;
 					}
 				}
 			}
@@ -511,7 +575,9 @@ pub fn serve(dir: &str) -> Result<(), Box<dyn Error>> {
 
 	// Signal that we're ready to receive commands (do NOT send VERSION here,
 	// wait for the client to initiate the handshake with VERSION)
-	println!(".");
+	use std::io::Write;
+	writeln!(std::io::stdout(), ".")?;
+	std::io::stdout().flush()?;
 
 	let mut dump_state: Option<DumpState> = None;
 
@@ -536,15 +602,16 @@ pub fn serve(dir: &str) -> Result<(), Box<dyn Error>> {
 				};
 
 				if version == PROTOCOL_VERSION {
-					println!("VERSION:{}", PROTOCOL_VERSION);
+					protocol_println!("VERSION:{}", PROTOCOL_VERSION);
 				} else {
 					error!(
 						"Protocol version mismatch: client={}, server={}",
 						version, PROTOCOL_VERSION
 					);
-					println!(
+					protocol_println!(
 						"ERROR:Protocol version mismatch: expected {}, got {}",
-						PROTOCOL_VERSION, version
+						PROTOCOL_VERSION,
+						version
 					);
 				}
 			}
@@ -557,7 +624,7 @@ pub fn serve(dir: &str) -> Result<(), Box<dyn Error>> {
 					})?;
 				}
 				None => {
-					println!("!Use LIST command first!");
+					protocol_println!("!Use LIST command first!");
 				}
 			},
 			"WRITE" => match &dump_state {
@@ -568,7 +635,7 @@ pub fn serve(dir: &str) -> Result<(), Box<dyn Error>> {
 					})?;
 				}
 				None => {
-					println!("!Use LIST command first!");
+					protocol_println!("!Use LIST command first!");
 				}
 			},
 			"COMMIT" => match &dump_state {
@@ -579,11 +646,15 @@ pub fn serve(dir: &str) -> Result<(), Box<dyn Error>> {
 					})?;
 				}
 				None => {
-					println!("!Use LIST command first!");
+					protocol_println!("!Use LIST command first!");
 				}
 			},
 			"QUIT" => break,
-			_ => println!("E:UNK-CMD: Unknown command: {}", &cmdline.trim()),
+			"." => {
+				// Dot command outside of WRITE mode - ignore it
+				// This is sent by cleanup to ensure we exit any active WRITE sessions
+			}
+			_ => protocol_println!("E:UNK-CMD: Unknown command: {}", &cmdline.trim()),
 		}
 	}
 	Ok(())
@@ -625,3 +696,5 @@ mod tests {
 		assert!(validate_path(path::Path::new("")).is_err());
 	}
 }
+
+// vim: ts=4

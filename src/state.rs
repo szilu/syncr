@@ -136,3 +136,5 @@ mod tests {
 		assert!(path.to_string_lossy().ends_with("myprofile.json"));
 	}
 }
+
+// vim: ts=4

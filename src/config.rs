@@ -199,3 +199,5 @@ pub enum Verbosity {
 	/// Debug output
 	Debug,
 }
+
+// vim: ts=4

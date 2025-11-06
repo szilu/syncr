@@ -293,3 +293,5 @@ impl Error for ConflictError {}
 pub fn box_error_to_sync_error(e: Box<dyn Error>) -> SyncError {
 	SyncError::Other { message: e.to_string() }
 }
+
+// vim: ts=4

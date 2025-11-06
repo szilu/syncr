@@ -4,6 +4,10 @@ version = "0.1.0"
 authors = ["Szilard Hajba <szilu@symbion.hu>"]
 edition = "2018"
 
+[features]
+default = []
+tui = ["ratatui", "crossterm"]
+
 [dependencies]
 base64 = "0.22"
 clap = "4.5"
@@ -17,6 +21,10 @@ termios = "0.3"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# TUI dependencies (optional, feature-gated)
+ratatui = { version = "0.29", optional = true }
+crossterm = { version = "0.28", optional = true }
 
 [dev-dependencies]
 tempfile = "3.8"

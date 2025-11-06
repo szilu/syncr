@@ -1,0 +1,1349 @@
+pub mod protocol;
+pub mod state;
+
+pub use self::protocol::{handshake, log_trace_message, parse_trace_message};
+pub use self::state::NodeState;
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::error::Error;
+use std::io::{self, Read};
+use std::path;
+use tokio::fs as afs;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::Mutex;
+
+// Use the old connect module directly (not the new connection.rs library API)
+use crate::connect;
+use crate::logging::*;
+#[allow(unused_imports)]
+use crate::metadata_utils;
+use crate::types::{Config, FileData, PreviousSyncState, SyncPhase};
+use crate::utils::{setup_signal_handlers, FileLock, TerminalGuard};
+
+//////////
+// Callbacks trait for sync progress notification //
+//////////
+
+/// Progress statistics for callbacks
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct ProgressUpdate {
+	pub phase: SyncPhase,
+	pub files_processed: usize,
+	pub files_total: usize,
+	pub bytes_transferred: u64,
+	pub bytes_total: u64,
+	pub transfer_rate: f64,
+}
+
+/// Comprehensive sync event type covering all callback needs
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub enum SyncCallbackEvent {
+	/// Phase lifecycle: phase name and is_starting (true) or completing (false)
+	PhaseChanged {
+		phase: SyncPhase,
+		is_starting: bool,
+	},
+
+	/// Progress update during phase
+	Progress(ProgressUpdate),
+
+	/// Node connection event
+	NodeConnecting {
+		node_id: usize,
+		location: String,
+	},
+
+	NodeReady {
+		node_id: usize,
+		location: String,
+	},
+
+	#[allow(dead_code)]
+	NodeDisconnecting {
+		node_id: usize,
+	},
+
+	/// Node statistics update (e.g., after collection completes)
+	NodeStats {
+		node_id: usize,
+		files_known: usize, // Files catalogued/scanned from this node
+		bytes_known: u64,
+	},
+
+	/// File discovered on a node during sync processing
+	FileDiscovered {
+		path: String,
+		node_id: usize,
+		exists: bool, // true if file exists on this node, false if missing
+	},
+
+	/// File operation event
+	FileOperation {
+		path: String,
+		operation: &'static str, // "create", "update", "delete"
+		is_starting: bool,
+		file_size: u64,
+		from_node: usize, // Source node (where file comes from)
+		to_node: usize,   // Destination node (where file is being sent)
+	},
+
+	/// Conflict event
+	Conflict {
+		path: String,
+		is_detected: bool, // true for detected, false for resolved
+		num_versions: usize,
+		winner: Option<usize>, // Some(node_id) if resolved
+	},
+}
+
+/// Trait for receiving sync events as a unified callback
+pub trait SyncProgressCallback: Send + Sync {
+	/// Called for all sync events - simple, unified interface
+	fn on_event(&self, _event: SyncCallbackEvent) {}
+}
+
+impl<T: Fn(SyncCallbackEvent) + Send + Sync> SyncProgressCallback for T {
+	fn on_event(&self, event: SyncCallbackEvent) {
+		self(event);
+	}
+}
+
+//////////
+// Sync Metrics and State //
+//////////
+
+/// Track metrics during sync for final reporting
+#[derive(Debug, Clone, Default)]
+struct SyncMetrics {
+	bytes_transferred: u64,
+	chunks_transferred: usize,
+	files_synced: usize,
+	dirs_created: usize,
+	files_deleted: usize,
+	conflicts_encountered: usize,
+	conflicts_resolved: usize,
+}
+
+/// Protocol version for handshake and compatibility checking
+struct SyncState {
+	nodes: Vec<NodeState>,
+	//tree: BTreeMap<path::PathBuf, u8>
+	//tree: BTreeMap<path::PathBuf, &FileData>
+}
+
+impl SyncState {
+	fn add_node(
+		&mut self,
+		send: tokio::process::ChildStdin,
+		recv: BufReader<tokio::process::ChildStdout>,
+	) {
+		let node = NodeState {
+			id: self.nodes.len() as u8 + 1,
+			send: Mutex::new(send),
+			recv: Mutex::new(recv),
+			dir: BTreeMap::new(),
+			chunks: BTreeSet::new(),
+			missing: Mutex::new(BTreeSet::new()),
+		};
+		self.nodes.push(node);
+	}
+}
+
+#[derive(Debug)]
+enum SyncOption<T> {
+	None,
+	Conflict,
+	Some(T),
+}
+
+impl<T> SyncOption<T> {
+	pub fn is_none(&self) -> bool {
+		matches!(self, SyncOption::None)
+	}
+
+	pub fn is_conflict(&self) -> bool {
+		matches!(self, SyncOption::Conflict)
+	}
+
+	pub fn is_some(&self) -> bool {
+		matches!(self, SyncOption::Some(_))
+	}
+}
+
+// Load previous sync state from JSON file for three-way merge detection
+async fn load_previous_state(config: &Config) -> Result<Option<PreviousSyncState>, Box<dyn Error>> {
+	let state_file = config.syncr_dir.join(format!("{}.profile.json", config.profile));
+
+	// If file doesn't exist, this is the first sync
+	if !state_file.exists() {
+		return Ok(None);
+	}
+
+	// Try to read and parse the state
+	let contents = afs::read_to_string(&state_file).await?;
+	let file_map: BTreeMap<String, FileData> = serde_json::from_str(&contents)?;
+
+	// Get current timestamp
+	let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+
+	Ok(Some(PreviousSyncState { files: file_map, timestamp }))
+}
+
+/// Message for resolving a conflict - contains path and chosen node index
+pub struct ConflictResolution {
+	pub path: String,
+	pub chosen_node: usize,
+}
+
+/// Sync with callbacks for progress and event notification
+/// If conflict_rx is provided, the sync will wait for conflict resolutions from the channel
+/// instead of prompting on stdin
+#[allow(dead_code)]
+pub async fn sync_with_callbacks(
+	config: Config,
+	dirs: Vec<&str>,
+	callbacks: Box<dyn SyncProgressCallback>,
+	conflict_rx: Option<std::sync::mpsc::Receiver<ConflictResolution>>,
+) -> Result<crate::types::SyncResult, Box<dyn Error>> {
+	sync_impl(config, dirs, Some(callbacks), conflict_rx).await
+}
+
+#[allow(dead_code)]
+pub async fn sync(config: Config, dirs: Vec<&str>) -> Result<(), Box<dyn Error>> {
+	sync_impl(config, dirs, None, None).await?;
+	Ok(())
+}
+
+/// Sync with progress display (but no interactive conflict resolution)
+pub async fn sync_with_cli_progress(config: Config, dirs: Vec<&str>) -> Result<(), Box<dyn Error>> {
+	eprintln!("Starting sync with progress display...");
+
+	// Create callback for progress display only
+	let callback = crate::progress::CliProgressCallback::new();
+
+	// No conflict channel - conflicts will be skipped
+	sync_impl(config, dirs, Some(Box::new(callback)), None).await?;
+	eprintln!(); // Final newline after progress
+	eprintln!("Sync complete!");
+	Ok(())
+}
+
+/// CLI-based conflict prompt callback
+/// Handles interactive conflict resolution by prompting the user on stdin
+struct ConflictPrompt {
+	conflict_tx: std::sync::Mutex<std::sync::mpsc::Sender<ConflictResolution>>,
+}
+
+impl ConflictPrompt {
+	/// Create a new conflict prompt callback
+	fn new(tx: std::sync::mpsc::Sender<ConflictResolution>) -> Self {
+		Self { conflict_tx: std::sync::Mutex::new(tx) }
+	}
+}
+
+impl SyncProgressCallback for ConflictPrompt {
+	fn on_event(&self, event: SyncCallbackEvent) {
+		if let SyncCallbackEvent::Conflict { path, is_detected, num_versions, winner: _ } = event {
+			if is_detected {
+				// Clear progress line and show conflict
+				eprintln!();
+				eprintln!("⚠️  Conflict detected: {}", path);
+				eprintln!("   {} versions exist on different nodes", num_versions);
+
+				// Prompt for resolution
+				loop {
+					// Write prompt to stdout so it's visible and in line with stdin
+					use std::io::Write;
+					print!("   Choose node (1-{}): ", num_versions);
+					let _ = std::io::stdout().flush();
+
+					let mut input = String::new();
+					match std::io::stdin().read_line(&mut input) {
+						Ok(bytes_read) => {
+							if bytes_read == 0 {
+								eprintln!("   Error: EOF reached. Skipping conflict.");
+								break;
+							}
+							let trimmed = input.trim();
+							match trimmed.parse::<usize>() {
+								Ok(choice) => {
+									if choice > 0 && choice <= num_versions {
+										let node_idx = choice - 1;
+										eprintln!(
+											"   Resolving to node {} (index {})",
+											choice, node_idx
+										);
+										if let Ok(tx) = self.conflict_tx.lock() {
+											let _ = tx.send(ConflictResolution {
+												path: path.clone(),
+												chosen_node: node_idx,
+											});
+										}
+										break;
+									} else {
+										eprintln!(
+											"   Invalid choice: {} (must be 1-{}). Try again.",
+											choice, num_versions
+										);
+									}
+								}
+								Err(_) => {
+									eprintln!(
+										"   Invalid input: '{}' (must be a number 1-{}). Try again.",
+										trimmed, num_versions
+									);
+								}
+							}
+						}
+						Err(e) => {
+							eprintln!("   Error reading input: {}. Skipping conflict.", e);
+							break;
+						}
+					}
+				}
+				eprintln!();
+			}
+		}
+	}
+}
+
+/// Sync with interactive conflict resolution (but no progress display)
+pub async fn sync_with_conflicts(config: Config, dirs: Vec<&str>) -> Result<(), Box<dyn Error>> {
+	eprintln!("Starting sync with conflict resolution...");
+
+	// Create a channel for conflict resolution
+	let (conflict_tx, conflict_rx) = std::sync::mpsc::channel();
+
+	// Create callback for conflict handling only
+	let callback = ConflictPrompt::new(conflict_tx);
+
+	sync_impl(config, dirs, Some(Box::new(callback)), Some(conflict_rx)).await?;
+	eprintln!("Sync complete!");
+	Ok(())
+}
+
+/// Composite callback that handles both progress and conflicts
+struct CompositeCallback {
+	progress: Box<dyn SyncProgressCallback>,
+	conflict: Box<dyn SyncProgressCallback>,
+}
+
+impl SyncProgressCallback for CompositeCallback {
+	fn on_event(&self, event: SyncCallbackEvent) {
+		// Forward event to both callbacks
+		self.progress.on_event(event.clone());
+		self.conflict.on_event(event);
+	}
+}
+
+/// Sync with both progress display and interactive conflict resolution
+pub async fn sync_with_progress_and_conflicts(
+	config: Config,
+	dirs: Vec<&str>,
+) -> Result<(), Box<dyn Error>> {
+	eprintln!("Starting sync with progress display and conflict resolution...");
+
+	// Create a channel for conflict resolution
+	let (conflict_tx, conflict_rx) = std::sync::mpsc::channel();
+
+	// Create progress callback
+	let progress_callback = Box::new(crate::progress::CliProgressCallback::new());
+
+	// Create conflict callback
+	let conflict_callback = Box::new(ConflictPrompt::new(conflict_tx));
+
+	// Combine both callbacks
+	let composite = CompositeCallback { progress: progress_callback, conflict: conflict_callback };
+
+	// Run sync with combined callback
+	sync_impl(config, dirs, Some(Box::new(composite)), Some(conflict_rx)).await?;
+
+	eprintln!(); // Final newline after progress
+	eprintln!("Sync complete!");
+	Ok(())
+}
+
+pub async fn sync_impl(
+	config: Config,
+	dirs: Vec<&str>,
+	callbacks: Option<Box<dyn SyncProgressCallback>>,
+	conflict_rx: Option<std::sync::mpsc::Receiver<ConflictResolution>>,
+) -> Result<crate::types::SyncResult, Box<dyn Error>> {
+	// Setup signal handlers for graceful cleanup
+	setup_signal_handlers();
+
+	// Acquire lock to prevent concurrent sync operations
+	info!("Acquiring lock...");
+	let _lock = FileLock::acquire(&config.syncr_dir)?;
+
+	let mut state = SyncState { nodes: Vec::new() };
+	let mut metrics = SyncMetrics::default();
+	let start_time = std::time::Instant::now();
+
+	// Run sync logic and ensure cleanup always happens
+	let result =
+		run_sync_logic(&mut state, config, dirs, callbacks, conflict_rx, &mut metrics).await;
+
+	// Always cleanup child processes, even on error
+	cleanup_nodes(&state).await;
+
+	// If sync succeeded, return a SyncResult with actual metrics
+	match result {
+		Ok(()) => {
+			let duration = start_time.elapsed();
+			Ok(crate::types::SyncResult {
+				files_synced: metrics.files_synced,
+				dirs_created: metrics.dirs_created,
+				files_deleted: metrics.files_deleted,
+				bytes_transferred: metrics.bytes_transferred,
+				chunks_transferred: metrics.chunks_transferred,
+				chunks_deduplicated: 0,
+				conflicts_encountered: metrics.conflicts_encountered,
+				conflicts_resolved: metrics.conflicts_resolved,
+				duration,
+				errors: vec![],
+			})
+		}
+		Err(e) => Err(e),
+	}
+}
+
+/// Internal sync implementation - separated to ensure cleanup always runs
+async fn run_sync_logic(
+	state: &mut SyncState,
+	config: Config,
+	dirs: Vec<&str>,
+	callbacks: Option<Box<dyn SyncProgressCallback>>,
+	conflict_rx: Option<std::sync::mpsc::Receiver<ConflictResolution>>,
+	metrics: &mut SyncMetrics,
+) -> Result<(), Box<dyn Error>> {
+	//let mut tree: BTreeMap<path::PathBuf, u8> = BTreeMap::new();
+	let mut tree: BTreeMap<path::PathBuf, Box<FileData>> = BTreeMap::new();
+
+	// Load previous sync state for three-way merge detection
+	info!("Loading previous state...");
+	let previous_state = load_previous_state(&config).await?;
+	if let Some(ref pstate) = previous_state {
+		info!("Loaded previous state with {} files", pstate.files.len());
+	} else {
+		info!("No previous state found (first sync)");
+	}
+
+	info!("Initializing processes...");
+	for (idx, dir) in dirs.iter().enumerate() {
+		// Notify that we're connecting
+		if let Some(ref cb) = callbacks {
+			cb.on_event(SyncCallbackEvent::NodeConnecting {
+				node_id: idx,
+				location: dir.to_string(),
+			});
+		}
+
+		let mut conn = connect::connect(dir).await?;
+
+		// Perform protocol handshake
+		info!("Handshaking with {}...", dir);
+		handshake(&mut conn.send, &mut conn.recv).await?;
+
+		// Notify that node is ready
+		if let Some(ref cb) = callbacks {
+			cb.on_event(SyncCallbackEvent::NodeReady { node_id: idx, location: dir.to_string() });
+		}
+
+		state.add_node(conn.send, conn.recv);
+	}
+
+	// Notify callbacks that we're collecting
+	if let Some(ref cb) = callbacks {
+		cb.on_event(SyncCallbackEvent::PhaseChanged {
+			phase: SyncPhase::Collecting,
+			is_starting: true,
+		});
+		cb.on_event(SyncCallbackEvent::Progress(ProgressUpdate {
+			phase: SyncPhase::Collecting,
+			files_processed: 0,
+			files_total: state.nodes.len(),
+			bytes_transferred: 0,
+			bytes_total: 0,
+			transfer_rate: 0.0,
+		}));
+	}
+
+	info!("Collecting...");
+
+	// Collect from all nodes in parallel to speed up collection
+	// Each node sends progress updates during collection
+	use futures::future::try_join_all;
+
+	let collection_tasks: Vec<_> = state
+		.nodes
+		.iter_mut()
+		.enumerate()
+		.map(|(idx, node)| {
+			let callback_ref = callbacks.as_ref().map(|cb| {
+				// Clone the Arc to share across tasks
+				std::sync::Arc::new(std::sync::Mutex::new(cb))
+			});
+			let node_id = idx;
+
+			async move {
+				// Collect with progress callback
+				node.do_collect(|files_count, bytes_count| {
+					// Send incremental progress update
+					if let Some(ref cb_arc) = callback_ref {
+						if let Ok(cb_guard) = cb_arc.lock() {
+							cb_guard.on_event(SyncCallbackEvent::NodeStats {
+								node_id,
+								files_known: files_count,
+								bytes_known: bytes_count,
+							});
+						}
+					}
+				})
+				.await?;
+
+				// Send final statistics after collection completes
+				let files_collected = node.dir.len();
+				let bytes_collected: u64 = node
+					.dir
+					.values()
+					.filter(|fd| matches!(fd.tp, crate::types::FileType::File))
+					.map(|fd| fd.size)
+					.sum();
+
+				debug!(
+					"Node {} collected {} files, {} bytes",
+					node_id, files_collected, bytes_collected
+				);
+
+				// Send final NodeStats to ensure we have the accurate final count
+				if let Some(ref cb_arc) = callback_ref {
+					if let Ok(cb_guard) = cb_arc.lock() {
+						cb_guard.on_event(SyncCallbackEvent::NodeStats {
+							node_id,
+							files_known: files_collected,
+							bytes_known: bytes_collected,
+						});
+					}
+				}
+
+				Ok::<(), Box<dyn std::error::Error>>(())
+			}
+		})
+		.collect();
+
+	// Wait for all collections to complete
+	try_join_all(collection_tasks).await?;
+
+	// Signal collection phase complete
+	if let Some(ref cb) = callbacks {
+		cb.on_event(SyncCallbackEvent::PhaseChanged {
+			phase: SyncPhase::Collecting,
+			is_starting: false,
+		});
+	}
+
+	for node in state.nodes.iter() {
+		for path in node.dir.keys() {
+			debug!("  - {}", path.display());
+		}
+	}
+
+	// Emit FileDiscovered events for ALL collected files so they appear in the Files tab
+	if let Some(ref cb) = callbacks {
+		let mut all_files: std::collections::BTreeSet<&path::Path> =
+			std::collections::BTreeSet::new();
+		for node in state.nodes.iter() {
+			for path in node.dir.keys() {
+				all_files.insert(path);
+			}
+		}
+
+		for path in all_files {
+			for (node_idx, node) in state.nodes.iter().enumerate() {
+				let exists = node.dir.contains_key(path);
+				cb.on_event(SyncCallbackEvent::FileDiscovered {
+					path: path.display().to_string(),
+					node_id: node_idx,
+					exists,
+				});
+			}
+		}
+	}
+
+	// Do diffing
+	info!("Running diff...");
+	if let Some(ref cb) = callbacks {
+		cb.on_event(SyncCallbackEvent::PhaseChanged {
+			phase: SyncPhase::DetectingConflicts,
+			is_starting: true,
+		});
+	}
+
+	// Configure terminal for key input (RAII guard ensures cleanup on panic)
+	// This will be None if stdin is not a terminal (e.g., piped input)
+	// NOTE: In TUI mode (when callbacks present), disable interactive terminal mode
+	// and let the TUI handle conflict resolution instead
+	let _terminal_guard = TerminalGuard::new();
+	let interactive_mode = _terminal_guard.is_some() && callbacks.is_none();
+
+	// Track conflicts for async resolution (TUI mode)
+	// Use RefCell to allow interior mutability in closures
+	let detected_conflicts =
+		std::cell::RefCell::new(Vec::<(path::PathBuf, Vec<Option<Box<FileData>>>)>::new());
+
+	info!("Starting diff loop, conflict_rx available: {}", conflict_rx.is_some());
+
+	let mut diff: BTreeMap<&path::Path, SyncOption<u8>> = BTreeMap::new();
+	let mut file_count = 0;
+	for node in &state.nodes {
+		for path in node.dir.keys() {
+			file_count += 1;
+			if file_count % 100 == 0 {
+				info!("Processing file {} in diff...", file_count);
+			}
+
+			// Get previous state for three-way merge
+			let prev_file = previous_state
+				.as_ref()
+				.and_then(|ps| ps.files.get(&path.to_string_lossy().to_string()));
+
+			diff.entry(path).or_insert_with(|| {
+				let mut files: Vec<Option<&Box<FileData>>> =
+					state.nodes.iter().map(|n| n.dir.get(path)).collect();
+				//let mut latest: Option<u8> = None;
+				let mut winner: SyncOption<u8> = SyncOption::None;
+
+				// Compare files on all nodes and find where to sync from
+				for (idx, file) in files.iter().enumerate() {
+					if let Some(f) = file {
+						// Three-way merge: compare with previous state if available
+						if let Some(prev) = prev_file {
+							if f.tp != prev.tp
+								|| f.mode != prev.mode || f.user != prev.user
+								|| f.group != prev.group || f.chunks != prev.chunks
+							{
+								debug!(
+									"diff {} {} {} {} {} (modified since last sync)",
+									f.tp != prev.tp,
+									f.mode != prev.mode,
+									f.user != prev.user,
+									f.group != prev.group,
+									f.chunks != prev.chunks
+								);
+								if winner.is_none() {
+									winner = SyncOption::Some(idx as u8);
+								} else if winner.is_some() {
+									winner = SyncOption::Conflict;
+								}
+							}
+						} else {
+							// No previous state - use old logic
+							if winner.is_none() {
+								winner = SyncOption::Some(idx as u8);
+							} else if let SyncOption::Some(win) = winner {
+								let w = files[win as usize].unwrap();
+								if f.tp != w.tp
+									|| f.mode != w.mode || f.user != w.user
+									|| f.group != w.group || f.chunks != w.chunks
+								{
+									winner = SyncOption::Conflict;
+								}
+							}
+						}
+					} else {
+						debug!("Node: {} <missing>", idx);
+					}
+				}
+
+				// Store original files BEFORE dedup for conflict resolution
+				// (User chooses by node index, not deduped file index)
+				let original_files = files.clone();
+
+				files.dedup();
+				if files.len() <= 1 {
+					winner = SyncOption::None;
+				}
+				if winner.is_conflict() {
+					metrics.conflicts_encountered += 1;
+
+					for (idx, file) in files.iter().enumerate() {
+						if let Some(f) = file {
+							warn!("    {}: {:?}", idx + 1, f);
+						}
+					}
+
+					// Fire conflict callback for TUI mode
+					if let Some(ref cb) = callbacks {
+						// First, send FileDiscovered events to track which nodes have the file
+						// Use ORIGINAL files (before dedup) to match node indices
+						for (node_idx, file_opt) in original_files.iter().enumerate() {
+							cb.on_event(SyncCallbackEvent::FileDiscovered {
+								path: path.display().to_string(),
+								node_id: node_idx,
+								exists: file_opt.is_some(),
+							});
+						}
+
+						// Then send the conflict event
+						cb.on_event(SyncCallbackEvent::Conflict {
+							path: path.to_string_lossy().to_string(),
+							is_detected: true,
+							num_versions: files.len(),
+							winner: None,
+						});
+					}
+
+					// TUI mode with conflict channel: collect conflict for later async resolution
+					if conflict_rx.is_some() && callbacks.is_some() {
+						info!(
+							"Conflict detected (TUI mode), will wait for resolution: {}",
+							path.display()
+						);
+						info!(
+							"  original_files.len() = {}, files.len() = {}",
+							original_files.len(),
+							files.len()
+						);
+
+						// Store ORIGINAL files (before dedup) so user can choose by node index
+						match detected_conflicts.try_borrow_mut() {
+							Ok(mut conflicts) => {
+								let cloned_files: Vec<Option<Box<FileData>>> = original_files
+									.iter()
+									.enumerate()
+									.map(|(i, f)| {
+										f.map(|b| {
+											info!("  Cloning file at index {}", i);
+											Box::new((**b).clone())
+										})
+									})
+									.collect();
+
+								info!("  Successfully cloned {} file entries", cloned_files.len());
+								conflicts.push((path.to_path_buf(), cloned_files));
+							}
+							Err(e) => {
+								panic!(
+									"Failed to borrow detected_conflicts for {}: {}",
+									path.display(),
+									e
+								);
+							}
+						}
+						// Keep winner as Conflict for now
+					} else if interactive_mode {
+						// Interactive mode: prompt user for conflict resolution on stdin
+						loop {
+							eprint!("? ");
+							let mut buf = [0; 1];
+							let keypress = io::stdin().read(&mut buf).map(|_| buf[0]);
+							if let Ok(key) = keypress {
+								debug!("{:?}", key);
+								if b'1' <= key && key <= b'0' + files.len() as u8 {
+									winner = SyncOption::Some(key - b'1');
+									break;
+								} else if key == b's' {
+									winner = SyncOption::None;
+									break;
+								}
+							}
+						}
+					} else {
+						// Non-interactive mode: skip conflicts by default
+						warn!("(non-interactive mode: skipping conflict)");
+						winner = SyncOption::None;
+					}
+				}
+				if let SyncOption::Some(win) = winner {
+					// Use original_files (not deduped) since winner is a node index
+					let w = original_files[win as usize].unwrap();
+					//state.tree.insert(path.clone(), win);
+					//tree.insert(path.clone(), win);
+					tree.insert(path.clone(), w.clone());
+				}
+				winner
+
+				/*
+				// FIXME: This algorithm always syncs from the latest modification
+				for (idx, file) in files.iter().enumerate() {
+					if let Some(f) = file {
+						if latest.is_none() || f.mtime > files[latest.unwrap() as usize].unwrap().mtime {
+							latest = Some(idx as u8);
+						}
+					}
+				}
+				files.dedup();
+				if files.len() <= 1 {
+					latest = None;
+				}
+				latest
+				*/
+			});
+		}
+	}
+
+	info!("Diff loop completed! Processed {} files", file_count);
+	//println!("DIFF: {:?}", diff);
+
+	// TUI mode: if we have conflicts, wait for all resolutions (blocking)
+	let conflicts_to_resolve = detected_conflicts.into_inner();
+	info!(
+		"After diff: detected {} conflicts, conflict_rx present: {}",
+		conflicts_to_resolve.len(),
+		conflict_rx.is_some()
+	);
+
+	if let Some(conflict_rx) = conflict_rx {
+		if !conflicts_to_resolve.is_empty() {
+			info!("Waiting for {} conflicts to be resolved...", conflicts_to_resolve.len());
+
+			// Track which conflicts have been resolved by path
+			let mut resolved_paths = std::collections::HashSet::new();
+			let total_conflicts = conflicts_to_resolve.len();
+
+			// Wait for resolutions in any order (blocking recv)
+			while resolved_paths.len() < total_conflicts {
+				match conflict_rx.recv() {
+					Ok(resolution) => {
+						// Find the conflict that matches this resolution
+						let mut found = false;
+						for (conflict_path, conflict_files) in &conflicts_to_resolve {
+							let path_str = conflict_path.to_string_lossy().to_string();
+							if resolution.path == path_str {
+								// Check if already resolved (user might press the key multiple times)
+								if resolved_paths.contains(&path_str) {
+									debug!(
+										"Conflict {} already resolved, ignoring duplicate",
+										path_str
+									);
+									found = true;
+									break;
+								}
+
+								if resolution.chosen_node < conflict_files.len() {
+									info!(
+										"Conflict resolved: {} -> node {}",
+										conflict_path.display(),
+										resolution.chosen_node
+									);
+									metrics.conflicts_resolved += 1;
+
+									// Apply the resolution to the diff
+									// IMPORTANT: Only update if the chosen node actually has the file
+									let winner = SyncOption::Some(resolution.chosen_node as u8);
+									if let SyncOption::Some(win) = winner {
+										if let Some(file) = &conflict_files[win as usize] {
+											tree.insert(conflict_path.clone(), file.clone());
+
+											// Update diff to reflect resolution
+											// Only update if we successfully got the file
+											if let Some(entry) =
+												diff.get_mut(conflict_path.as_path())
+											{
+												*entry =
+													SyncOption::Some(resolution.chosen_node as u8);
+											}
+										} else {
+											warn!(
+												"Chosen node {} doesn't have file {}, marking as None",
+												win,
+												conflict_path.display()
+											);
+											// Node doesn't have the file - mark as skip
+											if let Some(entry) =
+												diff.get_mut(conflict_path.as_path())
+											{
+												*entry = SyncOption::None;
+											}
+										}
+									}
+
+									resolved_paths.insert(path_str);
+									info!(
+										"Progress: {}/{} conflicts resolved",
+										resolved_paths.len(),
+										total_conflicts
+									);
+									found = true;
+									break;
+								} else {
+									warn!(
+										"Invalid node index in resolution: {}",
+										resolution.chosen_node
+									);
+									found = true;
+									break;
+								}
+							}
+						}
+
+						if !found {
+							warn!("Received resolution for unknown conflict: {}", resolution.path);
+						}
+					}
+					Err(_) => {
+						// Channel closed - skip remaining conflicts
+						warn!(
+							"Conflict resolution channel closed, {} conflicts remain unresolved",
+							total_conflicts - resolved_paths.len()
+						);
+						break;
+					}
+				}
+			}
+
+			info!("All conflicts resolved! Continuing with sync...");
+		}
+	}
+
+	// Signal that conflict detection phase is complete
+	if let Some(ref cb) = callbacks {
+		cb.on_event(SyncCallbackEvent::PhaseChanged {
+			phase: SyncPhase::DetectingConflicts,
+			is_starting: false,
+		});
+	}
+
+	// Detect deleted files: files that existed in previous sync but are missing from all nodes
+	let mut deleted_files: Vec<String> = Vec::new();
+	if let Some(prev_state) = &previous_state {
+		for prev_path in prev_state.files.keys() {
+			let path_buf = path::PathBuf::from(prev_path);
+			// Check if this file exists on any node
+			let exists_on_any_node =
+				state.nodes.iter().any(|node| node.dir.contains_key(&path_buf));
+
+			if !exists_on_any_node {
+				// File was in previous state but is missing from all nodes
+				debug!("File was deleted: {}", prev_path);
+				deleted_files.push(prev_path.clone());
+			}
+		}
+	}
+	info!("Found {} deleted files", deleted_files.len());
+
+	// Terminal will be automatically restored by TerminalGuard when it goes out of scope
+
+	/*
+	let mut json: String = "".to_owned();
+	for (file, node) in tree {
+		json.push('"');
+		json.push_str(&file.to_str().unwrap());
+		json.push_str("\":");
+		json.push_str(serde_json::to_string(state.nodes[node as usize].dir.get(&file).unwrap()).unwrap().as_str());
+	}
+	*/
+	let json = serde_json::to_string(&tree)
+		.map_err(|e| format!("Failed to serialize state to JSON: {}", e))?;
+	debug!("JSON: {}", json);
+	let fname = config.syncr_dir.clone().join("test.profile.json");
+	let mut f = afs::File::create(&fname).await?;
+	f.write_all(json.as_bytes()).await?;
+
+	// Do write meta
+	info!("Sending metadata...");
+	if let Some(ref cb) = callbacks {
+		cb.on_event(SyncCallbackEvent::PhaseChanged {
+			phase: SyncPhase::TransferringMetadata,
+			is_starting: true,
+		});
+	}
+	for node in &state.nodes {
+		node.send("WRITE").await?;
+	}
+
+	// Count total files that need syncing for progress tracking
+	let total_files = diff.iter().filter(|(_, to_do)| matches!(to_do, SyncOption::Some(_))).count();
+	let mut files_processed = 0;
+
+	for (path, to_do) in diff {
+		if let SyncOption::Some(todo) = to_do {
+			let files: Vec<Option<&Box<FileData>>> =
+				state.nodes.iter().map(|n| n.dir.get(path)).collect();
+
+			// Get the leader file from the chosen node
+			let lfile =
+				match files.get(todo as usize).and_then(|f| f.as_ref()) {
+					Some(f) => f,
+					None => {
+						error!("Diff points to node {} for file {} but node doesn't have it - skipping",
+						todo, path.display());
+						continue;
+					}
+				};
+
+			for (idx, file) in files.iter().enumerate() {
+				if idx != todo as usize {
+					let mut trans_meta = false;
+					let mut trans_data = false;
+					if let Some(file) = file {
+						if file != lfile {
+							trans_meta = true;
+							if file.chunks != lfile.chunks {
+								trans_data = true;
+							}
+						}
+					} else {
+						trans_meta = true;
+						trans_data = true;
+					}
+					if trans_meta {
+						let node = &state.nodes[idx];
+						node.write_file(lfile, trans_data).await?;
+					}
+				}
+			}
+
+			// Update progress after each file
+			files_processed += 1;
+			metrics.files_synced = total_files; // All files in diff were processed
+
+			if let Some(ref cb) = callbacks {
+				cb.on_event(SyncCallbackEvent::Progress(ProgressUpdate {
+					phase: SyncPhase::TransferringMetadata,
+					files_processed,
+					files_total: total_files,
+					bytes_transferred: 0,
+					bytes_total: 0,
+					transfer_rate: 0.0,
+				}));
+			}
+		}
+	}
+
+	// Send delete commands for files that were deleted
+	info!("Sending delete commands...");
+	for deleted_path in &deleted_files {
+		// Notify callbacks that file deletion is starting
+		if let Some(ref cb) = callbacks {
+			cb.on_event(SyncCallbackEvent::FileOperation {
+				path: deleted_path.clone(),
+				operation: "delete",
+				is_starting: true,
+				file_size: 0,
+				from_node: 0,
+				to_node: 0, // Deletes go to all nodes
+			});
+		}
+
+		for node in &state.nodes {
+			node.send(&format!("DEL:{}", deleted_path)).await?;
+		}
+
+		metrics.files_deleted += 1;
+
+		// Notify callbacks that file deletion is complete
+		if let Some(ref cb) = callbacks {
+			cb.on_event(SyncCallbackEvent::FileOperation {
+				path: deleted_path.clone(),
+				operation: "delete",
+				is_starting: false,
+				file_size: 0,
+				from_node: 0,
+				to_node: 0,
+			});
+		}
+	}
+
+	// Metadata phase complete - send final progress
+	if let Some(ref cb) = callbacks {
+		cb.on_event(SyncCallbackEvent::PhaseChanged {
+			phase: SyncPhase::TransferringMetadata,
+			is_starting: false,
+		});
+		cb.on_event(SyncCallbackEvent::Progress(ProgressUpdate {
+			phase: SyncPhase::TransferringMetadata,
+			files_processed: total_files,
+			files_total: total_files,
+			bytes_transferred: 0,
+			bytes_total: 0,
+			transfer_rate: 0.0,
+		}));
+	}
+
+	// Do chunk transfers
+	info!("Transfering data chunks...");
+	if let Some(ref cb) = callbacks {
+		cb.on_event(SyncCallbackEvent::PhaseChanged {
+			phase: SyncPhase::TransferringChunks,
+			is_starting: true,
+		});
+	}
+
+	// Count total unique chunks and their sizes for progress tracking
+	let mut all_missing_chunks = BTreeSet::new();
+	let mut chunk_sizes: std::collections::HashMap<String, usize> =
+		std::collections::HashMap::new();
+
+	for node in &state.nodes {
+		let missing = node.missing.lock().await;
+		for chunk_hash in missing.iter() {
+			all_missing_chunks.insert(chunk_hash.clone());
+		}
+
+		// Build mapping of chunk hash to size from this node's files
+		for file_data in node.dir.values() {
+			for chunk in &file_data.chunks {
+				if all_missing_chunks.contains(&chunk.hash) || missing.contains(&chunk.hash) {
+					chunk_sizes.insert(chunk.hash.clone(), chunk.size);
+				}
+			}
+		}
+	}
+
+	// Calculate total bytes to transfer
+	let mut total_bytes_to_transfer: u64 = 0;
+	for hash in &all_missing_chunks {
+		if let Some(&size) = chunk_sizes.get(hash) {
+			total_bytes_to_transfer += size as u64;
+		}
+	}
+
+	let total_chunks = all_missing_chunks.len();
+	let mut chunks_transferred = 0;
+	let mut bytes_transferred: u64 = 0;
+	let chunk_transfer_start = std::time::Instant::now();
+	info!(
+		"Total chunks to transfer: {} ({:.2} MB)",
+		total_chunks,
+		total_bytes_to_transfer as f64 / 1_000_000.0
+	);
+
+	// Track bytes transferred from each source node to each destination node for statistics
+	let mut node_to_node_bytes: std::collections::HashMap<(usize, usize), u64> =
+		std::collections::HashMap::new();
+
+	let mut done: BTreeSet<String> = BTreeSet::new();
+	for (src_idx, srcnode) in state.nodes.iter().enumerate() {
+		debug!("  - NODE {}", srcnode.id);
+		srcnode.send(".\nREAD").await?;
+		for (dst_idx, dstnode) in state.nodes.iter().enumerate() {
+			if dst_idx != src_idx {
+				let missing = dstnode.missing.lock().await;
+				for chunk in missing.iter() {
+					if !done.contains(chunk) {
+						//eprintln!("MISSING CHUNK: {} {:?}", chunk, srcnode.chunks.get(chunk));
+						if srcnode.chunks.contains(chunk) {
+							srcnode.send(chunk).await?;
+							done.insert(String::from(chunk));
+						}
+					}
+				}
+			}
+		}
+		srcnode.send(".").await?;
+		let mut buf = String::new();
+		let mut chunk = String::new();
+		let mut chunkdata = String::new();
+		loop {
+			buf.clear();
+			srcnode.recv.lock().await.read_line(&mut buf).await?;
+
+			// Skip trace messages from child
+			if let Some((level, message)) = parse_trace_message(buf.trim()) {
+				log_trace_message(level, &message, srcnode.id);
+				continue;
+			}
+
+			if chunk.is_empty() && buf.len() >= 2 && &buf[..2] == "C:" {
+				chunk.clear();
+				chunk.push_str(&buf.trim()[2..]);
+				chunkdata.clear();
+			} else if chunk.is_empty() && buf.trim() == "." {
+				break;
+			} else if buf.trim() == "." {
+				chunkdata.push('.');
+				let data = &["C:", &chunk, "\n", &chunkdata].join("");
+
+				// Calculate actual bytes in this chunk (base64 decode ratio)
+				// chunkdata includes the terminating ".\n" and base64 content
+				let chunk_size = (chunkdata.len() as f64 * 3.0 / 4.0) as u64;
+
+				for (dst_idx, dstnode) in state.nodes.iter().enumerate() {
+					if dst_idx != src_idx {
+						let mut missing = dstnode.missing.lock().await;
+						if missing.get(&chunk).is_some() {
+							// Send chunk
+							dstnode.send(data).await?;
+							missing.remove(&chunk);
+							// Track bytes sent from source to destination node
+							*node_to_node_bytes.entry((src_idx, dst_idx)).or_insert(0) +=
+								chunk_size;
+
+							// Update progress for chunk transfer
+							chunks_transferred += 1;
+							bytes_transferred += chunk_size;
+
+							// Update metrics
+							metrics.chunks_transferred = chunks_transferred;
+							metrics.bytes_transferred = bytes_transferred;
+
+							let elapsed_secs = chunk_transfer_start.elapsed().as_secs_f64();
+							let transfer_rate = if elapsed_secs > 0.0 {
+								(bytes_transferred as f64 / 1_000_000.0) / elapsed_secs // MB/s
+							} else {
+								0.0
+							};
+
+							if let Some(ref cb) = callbacks {
+								cb.on_event(SyncCallbackEvent::Progress(ProgressUpdate {
+									phase: SyncPhase::TransferringChunks,
+									files_processed: chunks_transferred,
+									files_total: total_chunks,
+									bytes_transferred,
+									bytes_total: total_bytes_to_transfer,
+									transfer_rate,
+								}));
+							}
+						}
+					}
+				}
+				chunk.clear();
+				chunkdata.clear();
+			} else {
+				chunkdata += &buf;
+			}
+		}
+		srcnode.send("WRITE").await?;
+	}
+
+	// Close WRITE sessions
+	for node in &state.nodes {
+		node.send(".").await?;
+	}
+
+	// Emit FileOperation events for actual chunk transfers
+	// This properly tracks which nodes actually sent chunks to which other nodes
+	for ((src_idx, dst_idx), bytes) in node_to_node_bytes.iter() {
+		if *bytes > 0 {
+			if let Some(ref cb) = callbacks {
+				// We don't have individual file names for chunks, so use a generic name
+				cb.on_event(SyncCallbackEvent::FileOperation {
+					path: format!("(chunks: {} bytes)", bytes),
+					operation: "chunk_transfer",
+					is_starting: false,
+					file_size: *bytes,
+					from_node: *src_idx,
+					to_node: *dst_idx,
+				});
+			}
+		}
+	}
+
+	// Chunk transfer phase complete - send final progress
+	if let Some(ref cb) = callbacks {
+		cb.on_event(SyncCallbackEvent::PhaseChanged {
+			phase: SyncPhase::TransferringChunks,
+			is_starting: false,
+		});
+		cb.on_event(SyncCallbackEvent::Progress(ProgressUpdate {
+			phase: SyncPhase::TransferringChunks,
+			files_processed: total_chunks,
+			files_total: total_chunks,
+			bytes_transferred: total_bytes_to_transfer,
+			bytes_total: total_bytes_to_transfer,
+			transfer_rate: 0.0,
+		}));
+	}
+
+	// Commit modifications (do renames)
+	info!("Commiting changes...");
+	if let Some(ref cb) = callbacks {
+		cb.on_event(SyncCallbackEvent::PhaseChanged {
+			phase: SyncPhase::Committing,
+			is_starting: true,
+		});
+	}
+	let total_nodes = state.nodes.len();
+	let mut nodes_committed = 0;
+	for node in &state.nodes {
+		node.send("COMMIT").await?;
+		// Wait for response and check for errors
+		let mut buf = String::new();
+		loop {
+			buf.clear();
+			node.recv.lock().await.read_line(&mut buf).await?;
+
+			// Skip trace messages from child
+			if let Some((level, message)) = parse_trace_message(buf.trim()) {
+				log_trace_message(level, &message, node.id);
+				continue;
+			}
+
+			let response = buf.trim();
+			if response.starts_with("ERROR:") {
+				return Err(format!("Node {} failed to commit: {}", node.id, response).into());
+			} else if response == "OK" {
+				nodes_committed += 1;
+				// Send progress after each node commits
+				if let Some(ref cb) = callbacks {
+					cb.on_event(SyncCallbackEvent::Progress(ProgressUpdate {
+						phase: SyncPhase::Committing,
+						files_processed: nodes_committed,
+						files_total: total_nodes,
+						bytes_transferred: 0,
+						bytes_total: 0,
+						transfer_rate: 0.0,
+					}));
+				}
+				break;
+			} else {
+				return Err(
+					format!("Node {} returned unexpected response: {}", node.id, response).into()
+				);
+			}
+		}
+	}
+
+	// Cleanup is handled by cleanup_nodes below
+	Ok(())
+}
+
+/// Gracefully shut down child processes by sending QUIT and waiting for acknowledgment
+async fn cleanup_nodes(state: &SyncState) {
+	info!("Shutting down child processes...");
+	for node in &state.nodes {
+		// First, try to exit any active WRITE sessions by sending "."
+		// If node is in WRITE mode, "." exits it; if not in WRITE mode, it's ignored
+		let _ = node.send(".").await;
+
+		// Send QUIT command
+		if let Err(e) = node.send("QUIT").await {
+			warn!("Failed to send QUIT to node {}: {}", node.id, e);
+			continue;
+		}
+
+		// Wait for acknowledgment (.) or EOF
+		let mut buf = String::new();
+		loop {
+			buf.clear();
+			match node.recv.lock().await.read_line(&mut buf).await {
+				Ok(0) => {
+					// EOF - child closed connection
+					debug!("Node {} closed connection", node.id);
+					break;
+				}
+				Ok(_) => {
+					if buf.trim() == "." {
+						debug!("Node {} acknowledged QUIT", node.id);
+						break;
+					}
+					// Skip any remaining trace messages from child
+					if let Some((level, message)) = parse_trace_message(buf.trim()) {
+						log_trace_message(level, &message, node.id);
+					}
+				}
+				Err(e) => {
+					warn!("Error reading from node {} during shutdown: {}", node.id, e);
+					break;
+				}
+			}
+		}
+	}
+	info!("All child processes shut down");
+}
+
+// vim: ts=4

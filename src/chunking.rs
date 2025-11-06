@@ -97,3 +97,5 @@ mod tests {
 		assert!(result.is_err());
 	}
 }
+
+// vim: ts=4

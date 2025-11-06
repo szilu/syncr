@@ -283,3 +283,5 @@ impl SyncCallbacks for CompositeCallbacks {
 		}
 	}
 }
+
+// vim: ts=4

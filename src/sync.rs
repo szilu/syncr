@@ -456,3 +456,5 @@ mod tests {
 		assert_eq!(builder.config.chunk_config.chunk_bits, 21);
 	}
 }
+
+// vim: ts=4

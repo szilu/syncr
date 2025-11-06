@@ -159,3 +159,5 @@ impl Node {
 		&mut self.recv
 	}
 }
+
+// vim: ts=4

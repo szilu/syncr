@@ -7,7 +7,7 @@ use std::path;
 use std::time::Duration;
 
 /// Configuration (kept for backward compatibility with existing code)
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Config {
 	pub syncr_dir: path::PathBuf,
 	pub profile: String,
@@ -285,3 +285,5 @@ mod test {
 		assert_eq!(config.profile, "test");
 	}
 }
+
+// vim: ts=4

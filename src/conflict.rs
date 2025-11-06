@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 /// Represents a sync conflict between nodes
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct Conflict {
 	/// Unique conflict identifier
 	pub id: u64,
@@ -21,6 +22,7 @@ pub struct Conflict {
 
 /// Types of conflicts that can occur
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum ConflictType {
 	/// File modified differently on multiple nodes
 	ModifyModify,
@@ -37,6 +39,7 @@ pub enum ConflictType {
 
 /// A specific version of a file in a conflict
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct FileVersion {
 	/// Which node has this version
 	pub node_index: usize,
@@ -50,11 +53,13 @@ pub struct FileVersion {
 
 impl FileVersion {
 	/// Get the modification time
+	#[allow(dead_code)]
 	pub fn mtime(&self) -> u32 {
 		self.file_data.mtime
 	}
 
 	/// Get the file size
+	#[allow(dead_code)]
 	pub fn size(&self) -> u64 {
 		self.file_data.size
 	}
@@ -62,6 +67,7 @@ impl FileVersion {
 
 impl Conflict {
 	/// Create a new conflict
+	#[allow(dead_code)]
 	pub fn new(
 		id: u64,
 		path: PathBuf,
@@ -72,26 +78,31 @@ impl Conflict {
 	}
 
 	/// Get the number of conflicting versions
+	#[allow(dead_code)]
 	pub fn version_count(&self) -> usize {
 		self.versions.len()
 	}
 
 	/// Find the version with the newest modification time
+	#[allow(dead_code)]
 	pub fn newest_version(&self) -> Option<usize> {
 		self.versions.iter().enumerate().max_by_key(|(_, v)| v.mtime()).map(|(i, _)| i)
 	}
 
 	/// Find the version with the oldest modification time
+	#[allow(dead_code)]
 	pub fn oldest_version(&self) -> Option<usize> {
 		self.versions.iter().enumerate().min_by_key(|(_, v)| v.mtime()).map(|(i, _)| i)
 	}
 
 	/// Find the version with the largest file
+	#[allow(dead_code)]
 	pub fn largest_version(&self) -> Option<usize> {
 		self.versions.iter().enumerate().max_by_key(|(_, v)| v.size()).map(|(i, _)| i)
 	}
 
 	/// Find the version with the smallest file
+	#[allow(dead_code)]
 	pub fn smallest_version(&self) -> Option<usize> {
 		self.versions.iter().enumerate().min_by_key(|(_, v)| v.size()).map(|(i, _)| i)
 	}
@@ -172,3 +183,5 @@ mod tests {
 		assert_eq!(conflict.largest_version(), Some(1));
 	}
 }
+
+// vim: ts=4

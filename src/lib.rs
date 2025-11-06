@@ -50,3 +50,5 @@ pub mod util;
 pub use config::SyncConfig;
 pub use error::{ChunkError, ConflictError, ConnectionError, StateError, SyncError};
 pub use types::{FileChunk, FileData, FileType, HashChunk};
+
+// vim: ts=4
