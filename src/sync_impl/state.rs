@@ -18,8 +18,8 @@ pub struct NodeState {
 	pub send: Mutex<tokio::process::ChildStdin>,
 	pub recv: Mutex<BufReader<tokio::process::ChildStdout>>,
 	pub dir: BTreeMap<path::PathBuf, Box<FileData>>,
-	pub chunks: BTreeSet<String>,
-	pub missing: Mutex<BTreeSet<String>>,
+	pub chunks: BTreeSet<[u8; 32]>,       // Binary BLAKE3 hashes
+	pub missing: Mutex<BTreeSet<String>>, // Base64-encoded hashes needing transfer
 }
 
 impl PartialEq for NodeState {
@@ -50,14 +50,15 @@ impl NodeState {
 					);
 					sender.write_all(format!("{}\n", msg).as_bytes()).await?;
 					for chunk in &file.chunks {
+						let hash_b64 = crate::util::hash_to_base64(&chunk.hash);
 						if !self.chunks.contains(&chunk.hash) {
 							// Chunk needs transfer
-							let msg = format!("RC:{}:{}:{}", chunk.offset, chunk.size, chunk.hash);
+							let msg = format!("RC:{}:{}:{}", chunk.offset, chunk.size, hash_b64);
 							sender.write_all(format!("{}\n", msg).as_bytes()).await?;
-							self.missing.lock().await.insert(chunk.hash.clone());
+							self.missing.lock().await.insert(hash_b64);
 						} else {
 							// Chunk is available locally
-							let msg = format!("LC:{}:{}:{}", chunk.offset, chunk.size, chunk.hash);
+							let msg = format!("LC:{}:{}:{}", chunk.offset, chunk.size, hash_b64);
 							sender.write_all(format!("{}\n", msg).as_bytes()).await?;
 						}
 					}

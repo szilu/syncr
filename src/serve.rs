@@ -162,11 +162,13 @@ impl DumpState {
 		buf: &[u8],
 	) -> Result<(), Box<dyn Error>> {
 		// Verify hash before writing to detect corruption during transfer
-		let computed_hash = util::hash(buf);
+		let computed_hash = util::hash_binary(buf);
 		if computed_hash != chunk.hash {
+			let expected_b64 = crate::util::hash_to_base64(&chunk.hash);
+			let computed_b64 = crate::util::hash_to_base64(&computed_hash);
 			return Err(format!(
-				"Hash mismatch for chunk {}: expected {}, got {}",
-				chunk.hash, chunk.hash, computed_hash
+				"Hash mismatch for chunk: expected {}, got {}",
+				expected_b64, computed_b64
 			)
 			.into());
 		}
@@ -423,13 +425,15 @@ async fn serve_write(dir: path::PathBuf, dump_state: &DumpState) -> Result<(), B
 				if file.is_none() {
 					return Err("Protocol error: chunk command without file".into());
 				}
+				let hash = crate::util::base64_to_hash(fields[3])
+					.map_err(|e| format!("Invalid hash: {}", e))?;
 				let hc = HashChunk {
-					hash: String::from(fields[3]),
+					hash,
 					offset: fields[1]
 						.parse()
 						.map_err(|e| format!("Invalid offset '{}': {}", fields[1], e))?,
 					size: fields[2]
-						.parse()
+						.parse::<u32>()
 						.map_err(|e| format!("Invalid size '{}': {}", fields[2], e))?,
 				};
 				if cmd == "LC" {
@@ -459,7 +463,9 @@ async fn serve_write(dir: path::PathBuf, dump_state: &DumpState) -> Result<(), B
 			"C" => {
 				let fields = protocol_utils::parse_protocol_line(&buf, 2)?;
 				let mut buf = String::new();
-				let hash = fields[1];
+				let hash_b64 = fields[1];
+				let hash = crate::util::base64_to_hash(hash_b64)
+					.map_err(|e| format!("Invalid hash: {}", e))?;
 				let mut chunk: Vec<u8> = Vec::new();
 				loop {
 					buf.clear();
@@ -473,21 +479,17 @@ async fn serve_write(dir: path::PathBuf, dump_state: &DumpState) -> Result<(), B
 				//eprintln!("DECODED CHUNK: {:?}", chunk);
 				let fc_vec_opt = {
 					let missing = dump_state.missing.borrow();
-					missing.get(hash).cloned()
+					missing.get(hash_b64).cloned()
 				};
 				if let Some(fc_vec) = fc_vec_opt {
 					for fc in fc_vec {
-						let hc = HashChunk {
-							hash: String::from(hash),
-							offset: fc.offset,
-							size: fc.size,
-						};
+						let hc = HashChunk { hash, offset: fc.offset, size: fc.size as u32 };
 						//let filepath = tmp_filename(&fc.path);
 						if let Err(e) = dump_state.write_chunk(&fc.path, &hc, &chunk).await {
 							error!("ERROR WRITING {}", e);
 						}
 					}
-					dump_state.missing.borrow_mut().remove(hash);
+					dump_state.missing.borrow_mut().remove(hash_b64);
 				}
 			}
 			"." => {

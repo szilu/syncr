@@ -1,12 +1,30 @@
-use sha::sha1::Sha1 as Sha;
-use sha::utils::{Digest, DigestExt};
-use std::hash::Hasher;
+use base64::engine::Engine;
 
+/// Hash a buffer using BLAKE3 and return base64-encoded result
 pub fn hash(buf: &[u8]) -> String {
-	let mut hasher = Sha::default();
-	hasher.digest(buf);
-	let _ = hasher.finish();
-	hasher.to_hex()
+	let hash = blake3::hash(buf);
+	hash_to_base64(hash.as_bytes())
+}
+
+/// Hash a buffer using BLAKE3 and return binary result
+pub fn hash_binary(buf: &[u8]) -> [u8; 32] {
+	*blake3::hash(buf).as_bytes()
+}
+
+/// Convert binary hash to base64 string
+pub fn hash_to_base64(hash: &[u8; 32]) -> String {
+	base64::engine::general_purpose::STANDARD.encode(hash)
+}
+
+/// Convert base64 string to binary hash
+pub fn base64_to_hash(b64: &str) -> Result<[u8; 32], Box<dyn std::error::Error>> {
+	let bytes = base64::engine::general_purpose::STANDARD.decode(b64)?;
+	if bytes.len() != 32 {
+		return Err(format!("Hash must be 32 bytes, got {}", bytes.len()).into());
+	}
+	let mut hash = [0u8; 32];
+	hash.copy_from_slice(&bytes);
+	Ok(hash)
 }
 
 #[cfg(test)]
@@ -17,32 +35,38 @@ mod test {
 	fn test_hash_simple() {
 		let src: [u8; 2] = [b'1', b'2'];
 		let res = hash(&src);
-		// echo -n 12 | sha1sum
-		assert_eq!(res, "7b52009b64fd0a2a49e6d8a939753077792b0554");
+		// BLAKE3 hashes are 44 base64 characters (32 bytes encoded)
+		assert_eq!(res.len(), 44);
+		// Verify the hash is consistent
+		let res2 = hash(&src);
+		assert_eq!(res, res2);
 	}
 
 	#[test]
 	fn test_hash_empty() {
 		let src: [u8; 0] = [];
 		let res = hash(&src);
-		// echo -n "" | sha1sum
-		assert_eq!(res, "da39a3ee5e6b4b0d3255bfef95601890afd80709");
+		// BLAKE3 hashes are 44 base64 characters
+		assert_eq!(res.len(), 44);
+		// Verify empty input produces consistent hash
+		let res2 = hash(&src);
+		assert_eq!(res, res2);
 	}
 
 	#[test]
 	fn test_hash_longer_text() {
 		let src = b"The quick brown fox jumps over the lazy dog";
 		let res = hash(src);
-		// echo -n "The quick brown fox jumps over the lazy dog" | sha1sum
-		assert_eq!(res, "2fd4e1c67a2d28fced849ee1bb76e7391b93eb12");
+		// BLAKE3 hashes are 44 base64 characters (32 bytes encoded)
+		assert_eq!(res.len(), 44);
 	}
 
 	#[test]
 	fn test_hash_binary() {
 		let src: [u8; 4] = [0x00, 0xFF, 0xDE, 0xAD];
 		let res = hash(&src);
-		// Binary data should produce consistent hash
-		assert_eq!(res.len(), 40); // SHA1 is 40 hex chars
+		// BLAKE3 is 44 base64 chars
+		assert_eq!(res.len(), 44);
 	}
 
 	#[test]

@@ -116,11 +116,47 @@ pub struct FileChunk {
 	pub size: usize,
 }
 
-#[derive(Clone, PartialEq, Debug, SerdeSerialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug)]
 pub struct HashChunk {
-	pub hash: String,
+	pub hash: [u8; 32], // BLAKE3 binary hash
 	pub offset: u64,
-	pub size: usize,
+	pub size: u32, // Changed from usize for cache optimization
+}
+
+impl SerdeSerialize for HashChunk {
+	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: Serializer,
+	{
+		let hash_b64 = crate::util::hash_to_base64(&self.hash);
+		let mut state = serializer.serialize_struct("HashChunk", 3)?;
+		state.serialize_field("hash", &hash_b64)?;
+		state.serialize_field("offset", &self.offset)?;
+		state.serialize_field("size", &self.size)?;
+		state.end()
+	}
+}
+
+impl<'de> Deserialize<'de> for HashChunk {
+	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+	where
+		D: serde::Deserializer<'de>,
+	{
+		use serde::de;
+
+		#[derive(Deserialize)]
+		struct HashChunkHelper {
+			hash: String,
+			offset: u64,
+			size: u32,
+		}
+
+		let helper = HashChunkHelper::deserialize(deserializer)?;
+		let hash = crate::util::base64_to_hash(&helper.hash)
+			.map_err(|_| de::Error::custom("invalid hash base64"))?;
+
+		Ok(HashChunk { hash, offset: helper.offset, size: helper.size })
+	}
 }
 
 #[derive(Clone, PartialEq, Debug, SerdeSerialize, Deserialize)]
@@ -192,16 +228,18 @@ mod test {
 
 	#[test]
 	fn test_hash_chunk_creation() {
-		let chunk = HashChunk { hash: String::from("abc123"), offset: 0, size: 1024 };
-		assert_eq!(chunk.hash, "abc123");
+		let hash = [0u8; 32];
+		let chunk = HashChunk { hash, offset: 0, size: 1024 };
+		assert_eq!(chunk.hash, hash);
 		assert_eq!(chunk.offset, 0);
 		assert_eq!(chunk.size, 1024);
 	}
 
 	#[test]
 	fn test_hash_chunk_equality() {
-		let chunk1 = HashChunk { hash: String::from("abc123"), offset: 0, size: 1024 };
-		let chunk2 = HashChunk { hash: String::from("abc123"), offset: 0, size: 1024 };
+		let hash = [1u8; 32];
+		let chunk1 = HashChunk { hash, offset: 0, size: 1024 };
+		let chunk2 = HashChunk { hash, offset: 0, size: 1024 };
 		assert_eq!(chunk1, chunk2);
 	}
 
@@ -227,8 +265,13 @@ mod test {
 
 	#[test]
 	fn test_file_data_with_chunks() {
-		let chunk1 = HashChunk { hash: String::from("hash1"), offset: 0, size: 1024 };
-		let chunk2 = HashChunk { hash: String::from("hash2"), offset: 1024, size: 512 };
+		let mut hash1 = [0u8; 32];
+		hash1[0] = 1;
+		let mut hash2 = [0u8; 32];
+		hash2[0] = 2;
+
+		let chunk1 = HashChunk { hash: hash1, offset: 0, size: 1024 };
+		let chunk2 = HashChunk { hash: hash2, offset: 1024, size: 512 };
 
 		let fd = FileData {
 			tp: FileType::File,
@@ -244,8 +287,8 @@ mod test {
 		};
 
 		assert_eq!(fd.chunks.len(), 2);
-		assert_eq!(fd.chunks[0].hash, "hash1");
-		assert_eq!(fd.chunks[1].hash, "hash2");
+		assert_eq!(fd.chunks[0].hash, hash1);
+		assert_eq!(fd.chunks[1].hash, hash2);
 		assert_eq!(fd.chunks[1].offset, 1024);
 	}
 

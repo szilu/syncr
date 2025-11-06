@@ -78,14 +78,18 @@ pub fn parse_symlink_metadata(buf: &str) -> Result<Box<FileData>, Box<dyn Error>
 }
 
 /// Parse chunk metadata from C: protocol line
-/// Format: C:offset:size:hash
+/// Format: C:offset:size:hash (hash is base64-encoded BLAKE3)
 /// Returns: HashChunk for this chunk
 #[allow(dead_code)]
 pub fn parse_chunk_metadata(buf: &str) -> Result<HashChunk, Box<dyn Error>> {
 	let fields = protocol_utils::parse_protocol_line(buf, 4)?;
 
+	let hash_b64 = fields[3];
+	let hash =
+		crate::util::base64_to_hash(hash_b64).map_err(|e| format!("Invalid hash base64: {}", e))?;
+
 	let hc = HashChunk {
-		hash: String::from(fields[3]),
+		hash,
 		offset: fields[1]
 			.parse()
 			.map_err(|e| format!("Invalid offset '{}': {}", fields[1], e))?,

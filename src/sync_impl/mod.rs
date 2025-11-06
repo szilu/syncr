@@ -1087,8 +1087,9 @@ async fn run_sync_logic(
 		// Build mapping of chunk hash to size from this node's files
 		for file_data in node.dir.values() {
 			for chunk in &file_data.chunks {
-				if all_missing_chunks.contains(&chunk.hash) || missing.contains(&chunk.hash) {
-					chunk_sizes.insert(chunk.hash.clone(), chunk.size);
+				let hash_b64 = crate::util::hash_to_base64(&chunk.hash);
+				if all_missing_chunks.contains(&hash_b64) || missing.contains(&hash_b64) {
+					chunk_sizes.insert(hash_b64, chunk.size as usize);
 				}
 			}
 		}
@@ -1123,12 +1124,15 @@ async fn run_sync_logic(
 		for (dst_idx, dstnode) in state.nodes.iter().enumerate() {
 			if dst_idx != src_idx {
 				let missing = dstnode.missing.lock().await;
-				for chunk in missing.iter() {
-					if !done.contains(chunk) {
-						//eprintln!("MISSING CHUNK: {} {:?}", chunk, srcnode.chunks.get(chunk));
-						if srcnode.chunks.contains(chunk) {
-							srcnode.send(chunk).await?;
-							done.insert(String::from(chunk));
+				for chunk_b64 in missing.iter() {
+					if !done.contains(chunk_b64) {
+						//eprintln!("MISSING CHUNK: {} {:?}", chunk_b64, srcnode.chunks.get(chunk_b64));
+						// Convert base64 hash to binary for chunks lookup
+						if let Ok(chunk_hash) = crate::util::base64_to_hash(chunk_b64) {
+							if srcnode.chunks.contains(&chunk_hash) {
+								srcnode.send(chunk_b64).await?;
+								done.insert(String::from(chunk_b64));
+							}
 						}
 					}
 				}
