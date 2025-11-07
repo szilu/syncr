@@ -4,6 +4,7 @@ use std::{env, fs, path};
 
 use crate::types::Config;
 
+mod cache;
 mod config;
 mod conflict;
 mod connect;

@@ -33,6 +33,7 @@
 //! }
 //! ```
 
+pub mod cache;
 pub mod callbacks;
 pub mod chunking;
 pub mod config;

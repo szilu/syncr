@@ -9,6 +9,7 @@ use tokio::fs as afs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 //use std::{thread, time};
 
+use crate::cache::ChildCache;
 use crate::config;
 use crate::logging::*;
 #[allow(unused_imports)]
@@ -113,6 +114,7 @@ pub struct DumpState {
 	pub chunks: BTreeMap<String, Vec<FileChunk>>,
 	pub missing: RefCell<BTreeMap<String, Vec<FileChunk>>>,
 	pub rename: RefCell<BTreeMap<path::PathBuf, path::PathBuf>>,
+	pub cache: Option<ChildCache>,
 }
 
 impl DumpState {
@@ -187,14 +189,34 @@ impl DumpState {
 
 fn traverse_dir<'a>(state: &'a mut DumpState, dir: path::PathBuf) -> BoxedAsyncResult<'a> {
 	Box::pin(async move {
-		for entry in fs::read_dir(&dir)? {
-			let entry = entry?;
+		let entries = match fs::read_dir(&dir) {
+			Ok(e) => e,
+			Err(e) => {
+				warn!("Cannot read directory {}: {}", dir.display(), e);
+				return Ok(());
+			}
+		};
+
+		for entry_result in entries {
+			let entry = match entry_result {
+				Ok(e) => e,
+				Err(e) => {
+					debug!("Error reading directory entry: {}", e);
+					continue;
+				}
+			};
 			let path = entry.path();
 			if state.exclude[0].matches_path(&path) {
 				continue;
 			}
 
-			let meta = fs::symlink_metadata(&path)?;
+			let meta = match fs::symlink_metadata(&path) {
+				Ok(m) => m,
+				Err(e) => {
+					warn!("Cannot access {}: {}", path.display(), e);
+					continue;
+				}
+			};
 
 			if meta.is_file() {
 				protocol_println!(
@@ -208,10 +230,62 @@ fn traverse_dir<'a>(state: &'a mut DumpState, dir: path::PathBuf) -> BoxedAsyncR
 					meta.size()
 				);
 
-				let mut f = afs::File::open(&path).await?;
+				// Check cache first
+				let rel_path = path.to_string_lossy().to_string();
+				let mtime = meta.mtime() as u32;
+
+				if let Some(ref cache) = state.cache {
+					match cache.get_chunks(&rel_path, mtime) {
+						Ok(Some(cached_chunks)) => {
+							// Cache hit - use cached chunks without reading file
+							info!("Cache hit: {}", rel_path);
+							for chunk in &cached_chunks {
+								let hash_b64 = util::hash_to_base64(&chunk.hash);
+								protocol_println!(
+									"C:{}:{}:{}",
+									chunk.offset,
+									chunk.size,
+									&hash_b64
+								);
+								state.add_chunk(
+									hash_b64,
+									path.clone(),
+									chunk.offset,
+									chunk.size as usize,
+								);
+							}
+							continue;
+						}
+						Ok(None) => {
+							// Cache miss - need to hash file
+							info!("Cache miss: {}", rel_path);
+						}
+						Err(e) => {
+							warn!("Cache lookup error for {}: {}", rel_path, e);
+						}
+					}
+				}
+
+				// Cache miss or no cache - hash the file
+				let mut chunks_for_cache = Vec::new();
+
+				let mut f = match afs::File::open(&path).await {
+					Ok(file) => file,
+					Err(e) => {
+						warn!("Cannot open file {}: {}", path.display(), e);
+						continue;
+					}
+				};
+
 				let mut buf: Vec<u8> = vec![0; config::MAX_CHUNK_SIZE];
 
-				let mut n = f.read(&mut buf).await?;
+				let mut n = match f.read(&mut buf).await {
+					Ok(bytes) => bytes,
+					Err(e) => {
+						warn!("Cannot read file {}: {}", path.display(), e);
+						continue;
+					}
+				};
 
 				let mut offset: u64 = 0;
 				//let mut bup = Bup::new_with_chunk_bits(config::CHUNK_BITS);
@@ -223,9 +297,18 @@ fn traverse_dir<'a>(state: &'a mut DumpState, dir: path::PathBuf) -> BoxedAsyncR
 					}
 					if let Some((count, _hash)) = bup.find_chunk_edge(&buf[..endofs]) {
 						let h = util::hash(&buf[..count]);
+						let hash_binary = util::hash_binary(&buf[..count]);
 						protocol_println!("C:{}:{}:{}", offset, count, &h);
 						//state.chunks.insert(h, path.clone());
 						state.add_chunk(h, path.clone(), offset, count);
+
+						// Store chunk for caching
+						chunks_for_cache.push(HashChunk {
+							hash: hash_binary,
+							offset,
+							size: count as u32,
+						});
+
 						unsafe {
 							std::ptr::copy(buf[count..].as_mut_ptr(), buf.as_mut_ptr(), n - count);
 						}
@@ -234,13 +317,52 @@ fn traverse_dir<'a>(state: &'a mut DumpState, dir: path::PathBuf) -> BoxedAsyncR
 					} else {
 						let count = endofs;
 						let h = util::hash(&buf[..count]);
+						let hash_binary = util::hash_binary(&buf[..count]);
 						protocol_println!("C:{}:{}:{}", offset, count, &h);
 						//state.chunks.insert(h, path.clone());
 						state.add_chunk(h, path.clone(), offset, count);
+
+						// Store chunk for caching
+						chunks_for_cache.push(HashChunk {
+							hash: hash_binary,
+							offset,
+							size: count as u32,
+						});
+
 						offset += count as u64;
 						n -= count;
 					}
-					n += f.read(&mut buf[n..]).await?;
+
+					let read_result = f.read(&mut buf[n..]).await;
+					match read_result {
+						Ok(bytes) => n += bytes,
+						Err(e) => {
+							warn!(
+								"Error reading file {} at offset {}: {}",
+								path.display(),
+								offset,
+								e
+							);
+							break;
+						}
+					}
+				}
+
+				// Store chunks in cache
+				if let Some(ref cache) = state.cache {
+					let entry = crate::cache::CacheEntry {
+						mtime,
+						uid: meta.uid(),
+						gid: meta.gid(),
+						ctime: meta.ctime() as u32,
+						size: meta.size(),
+						mode: meta.mode(),
+						chunks: chunks_for_cache,
+					};
+					match cache.set(&rel_path, entry) {
+						Ok(_) => info!("Cached chunks for: {}", rel_path),
+						Err(e) => warn!("Failed to cache chunks for {}: {}", rel_path, e),
+					}
 				}
 			}
 			if meta.file_type().is_symlink() {
@@ -278,11 +400,42 @@ fn traverse_dir<'a>(state: &'a mut DumpState, dir: path::PathBuf) -> BoxedAsyncR
 }
 
 pub fn serve_list(dir: path::PathBuf) -> Result<DumpState, Box<dyn Error>> {
+	// Initialize global cache
+	let cache = {
+		let cache_dir = path::PathBuf::from(env::var("HOME").unwrap_or_else(|_| ".".to_string()))
+			.join(".syncr/cache");
+		let _ = fs::create_dir_all(&cache_dir);
+
+		let cache_db_path = cache_dir.join("cache.db");
+
+		match ChildCache::open(&cache_db_path) {
+			Ok(c) => {
+				info!("Cache opened: {}", cache_db_path.display());
+				Some(c)
+			}
+			Err(e) => {
+				info!("Cache unavailable (continuing without): {}", e);
+				// Try to remove and recreate corrupted cache
+				if let Err(remove_err) = fs::remove_file(&cache_db_path) {
+					debug!("Could not remove old cache: {}", remove_err);
+				}
+				match ChildCache::open(&cache_db_path) {
+					Ok(c) => {
+						info!("Cache recovered by recreating database");
+						Some(c)
+					}
+					Err(_) => None,
+				}
+			}
+		}
+	};
+
 	let mut state = DumpState {
 		exclude: vec![glob::Pattern::new("**/*.SyNcR-TmP")?],
 		chunks: BTreeMap::new(),
 		missing: RefCell::new(BTreeMap::new()),
 		rename: RefCell::new(BTreeMap::new()),
+		cache,
 	};
 	tokio::task::block_in_place(|| {
 		tokio::runtime::Handle::current().block_on(traverse_dir(&mut state, dir))
@@ -544,10 +697,31 @@ fn cleanup_temp_files(dir: &path::Path) -> Result<(), Box<dyn Error>> {
 
 	// Walk directory tree looking for .SyNcR-TmP files (synchronous version)
 	fn scan_dir(dir: &path::Path, count: &mut u32) -> Result<(), Box<dyn Error>> {
-		for entry in fs::read_dir(dir)? {
-			let entry = entry?;
+		let entries = match fs::read_dir(dir) {
+			Ok(e) => e,
+			Err(e) => {
+				warn!("Cannot read directory {} during cleanup: {}", dir.display(), e);
+				return Ok(());
+			}
+		};
+
+		for entry_result in entries {
+			let entry = match entry_result {
+				Ok(e) => e,
+				Err(e) => {
+					debug!("Error reading directory entry during cleanup: {}", e);
+					continue;
+				}
+			};
+
 			let path = entry.path();
-			let metadata = fs::symlink_metadata(&path)?;
+			let metadata = match fs::symlink_metadata(&path) {
+				Ok(m) => m,
+				Err(e) => {
+					warn!("Cannot access {} during cleanup: {}", path.display(), e);
+					continue;
+				}
+			};
 
 			if let Some(name) = path.file_name() {
 				if let Some(name_str) = name.to_str() {
@@ -567,7 +741,9 @@ fn cleanup_temp_files(dir: &path::Path) -> Result<(), Box<dyn Error>> {
 							Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
 								debug!("Temp file already removed: {:?}", path);
 							}
-							Err(e) => return Err(e.into()),
+							Err(e) => {
+								warn!("Failed to remove temp file {:?}: {}", path, e);
+							}
 						}
 					}
 				}

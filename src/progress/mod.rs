@@ -5,9 +5,11 @@
 
 pub mod constants;
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Mutex;
 use std::time::Instant;
+use tracing::info;
 
 use crate::sync_impl::{SyncCallbackEvent, SyncProgressCallback};
 use crate::types::SyncPhase;
@@ -15,13 +17,20 @@ use crate::types::SyncPhase;
 /// Progress display constants
 pub use constants::*;
 
+/// Per-node collection statistics
+#[derive(Debug, Clone)]
+pub(crate) struct NodeCollectionStats {
+	pub(crate) files: usize,
+	pub(crate) bytes: u64,
+}
+
 /// Shared state for progress tracking
 #[derive(Debug)]
 pub struct ProgressState {
 	pub current_phase: Mutex<Option<SyncPhase>>,
 	pub last_update: Mutex<Instant>,
-	pub collection_files: Mutex<usize>,
-	pub collection_bytes: Mutex<u64>,
+	// Per-node collection stats during collecting phase
+	pub node_stats: Mutex<HashMap<usize, NodeCollectionStats>>,
 }
 
 impl ProgressState {
@@ -30,8 +39,7 @@ impl ProgressState {
 		Self {
 			current_phase: Mutex::new(None),
 			last_update: Mutex::new(Instant::now()),
-			collection_files: Mutex::new(0),
-			collection_bytes: Mutex::new(0),
+			node_stats: Mutex::new(HashMap::new()),
 		}
 	}
 }
@@ -68,27 +76,25 @@ impl SyncProgressCallback for CliProgressCallback {
 					*self.state.current_phase.lock().unwrap() = Some(phase);
 					// Reset collection stats for new phase
 					if !matches!(phase, SyncPhase::Collecting) {
-						*self.state.collection_files.lock().unwrap() = 0;
-						*self.state.collection_bytes.lock().unwrap() = 0;
+						*self.state.node_stats.lock().unwrap() = HashMap::new();
 					}
-					// Start new line for new phase
-					let _ = writeln!(std::io::stderr());
+					// Log phase change
 					let phase_name = format!("{:?}", phase);
-					let _ = writeln!(std::io::stderr(), "→ {} phase...", phase_name);
-					let _ = std::io::stderr().flush();
+					info!("→ {} phase...", phase_name);
 				}
 			}
-			SyncCallbackEvent::NodeStats { node_id: _, files_known, bytes_known } => {
-				// During collecting phase, show node stats as progress
+			SyncCallbackEvent::NodeStats { node_id, files_known, bytes_known } => {
+				// During collecting phase, show per-node stats as progress
 				if let Ok(phase) = self.state.current_phase.lock() {
 					if matches!(phase.as_ref(), Some(SyncPhase::Collecting)) {
-						// Update accumulated stats (take the max from all nodes)
-						let mut files = self.state.collection_files.lock().unwrap();
-						let mut bytes = self.state.collection_bytes.lock().unwrap();
-						*files = (*files).max(files_known);
-						*bytes = (*bytes).max(bytes_known);
-						drop(files); // Unlock before throttle check
-						drop(bytes);
+						// Update per-node stats
+						{
+							let mut stats = self.state.node_stats.lock().unwrap();
+							stats.insert(
+								node_id,
+								NodeCollectionStats { files: files_known, bytes: bytes_known },
+							);
+						} // Drop lock before throttle check
 
 						// Throttle updates to every 100ms
 						let mut last = self.state.last_update.lock().unwrap();
@@ -99,15 +105,25 @@ impl SyncProgressCallback for CliProgressCallback {
 						*last = Instant::now();
 						drop(last);
 
-						// Re-lock to read current values
-						let files = self.state.collection_files.lock().unwrap();
-						let bytes = self.state.collection_bytes.lock().unwrap();
-						let _ = write!(
-							std::io::stderr(),
-							"\r  Collecting: {} files | {:.1} MB",
-							*files,
-							*bytes as f64 / BYTES_PER_MB
-						);
+						// Display per-node stats on one line
+						let stats = self.state.node_stats.lock().unwrap();
+						let mut node_strs = Vec::new();
+
+						// Collect and sort nodes
+						let mut nodes: Vec<_> = stats.iter().collect();
+						nodes.sort_by_key(|&(node_id, _)| node_id);
+
+						for (node_id, node_stat) in nodes {
+							node_strs.push(format!(
+								"N{}: {}f/{:.1}MB",
+								node_id,
+								node_stat.files,
+								node_stat.bytes as f64 / BYTES_PER_MB
+							));
+						}
+
+						let _ =
+							write!(std::io::stderr(), "\r  Collecting: {}", node_strs.join(" | "));
 						let _ = std::io::stderr().flush();
 					}
 				}
@@ -128,7 +144,9 @@ impl SyncProgressCallback for CliProgressCallback {
 					} else {
 						0.0
 					};
-					let filled = (ratio * PROGRESS_BAR_WIDTH as f64) as usize;
+					// Clamp ratio to [0, 1] to prevent overflow in progress bar
+					let ratio_clamped = ratio.clamp(0.0, 1.0);
+					let filled = (ratio_clamped * PROGRESS_BAR_WIDTH as f64) as usize;
 					let bar = format!(
 						"[{}{}]",
 						"=".repeat(filled),
