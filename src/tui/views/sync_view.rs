@@ -74,10 +74,13 @@ fn render_overall_progress(frame: &mut Frame, area: Rect, state: &AppState) {
 		(0.0, "0/0 files".to_string())
 	};
 
+	// Clamp ratio to [0.0, 1.0] to avoid floating point precision issues
+	let percent = (ratio.clamp(0.0, 1.0) * 100.0) as u16;
+
 	let gauge = Gauge::default()
 		.block(Block::default().title("Overall Progress").borders(Borders::ALL))
 		.gauge_style(Style::default().fg(Color::Green).bg(Color::Black))
-		.percent((ratio * 100.0) as u16)
+		.percent(percent)
 		.label(label);
 
 	frame.render_widget(gauge, area);
@@ -99,10 +102,13 @@ fn render_phase_progress(frame: &mut Frame, area: Rect, state: &AppState) {
 	let mb_total = bytes_total as f64 / 1_000_000.0;
 	let mb_rate = rate / 1_000_000.0;
 
+	// Clamp ratio to [0.0, 1.0] to avoid floating point precision issues
+	let percent = (ratio.clamp(0.0, 1.0) * 100.0) as u16;
+
 	let gauge = Gauge::default()
 		.block(Block::default().title("Transfer Progress").borders(Borders::ALL))
 		.gauge_style(Style::default().fg(Color::Yellow).bg(Color::Black))
-		.percent((ratio * 100.0) as u16)
+		.percent(percent)
 		.label(format!("{:.1}/{:.1} MB @ {:.1} MB/s", mb_done, mb_total, mb_rate));
 
 	frame.render_widget(gauge, area);

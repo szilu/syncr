@@ -81,6 +81,14 @@ fn is_process_alive(_pid: u32) -> bool {
 	true
 }
 
+/// Check if an error indicates the database is already open
+fn is_database_already_open_error(error: &redb::DatabaseError) -> bool {
+	// Check if this is a DatabaseAlreadyOpen error by examining the error message
+	// redb returns this when attempting to open an already-open database
+	let error_msg = error.to_string();
+	error_msg.contains("DatabaseAlreadyOpen") || error_msg.contains("already open")
+}
+
 /// Guard that releases path locks when dropped
 #[derive(Debug)]
 pub struct PathLockGuard {
@@ -93,7 +101,9 @@ impl PathLockGuard {
 	fn release(&mut self) -> Result<(), Box<dyn Error>> {
 		if !self.paths.is_empty() {
 			// Try to open the database to release locks
-			// If DatabaseAlreadyOpen error, just skip cleanup - locks will be cleaned up by stale detection on next sync
+			// If the database is already open by the original ChildCache instance,
+			// that's expected and safe - locks will be released when ChildCache drops.
+			// Stale lock detection will clean up any remaining locks if needed.
 			match redb::Database::open(&self.db_path) {
 				Ok(db) => {
 					let write_txn = db.begin_write()?;
@@ -106,7 +116,7 @@ impl PathLockGuard {
 					write_txn.commit()?;
 					self.paths.clear();
 				}
-				Err(e) if e.to_string().contains("DatabaseAlreadyOpen") => {
+				Err(e) if is_database_already_open_error(&e) => {
 					// Database is still open (original ChildCache instance active)
 					// Locks will be released when the original ChildCache is dropped
 					// This is safe - stale lock detection will clean up if needed

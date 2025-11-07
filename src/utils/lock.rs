@@ -1,6 +1,6 @@
 //! Signal handlers for graceful termination
 
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Setup signal handlers for graceful cleanup on termination
 /// With path-level locking in the cache DB, locks are automatically
@@ -13,7 +13,7 @@ pub fn setup_signal_handlers() {
 		let mut sigterm = match signal::unix::signal(signal::unix::SignalKind::terminate()) {
 			Ok(stream) => stream,
 			Err(e) => {
-				eprintln!("Failed to setup SIGTERM handler: {}", e);
+				warn!("Failed to setup SIGTERM handler: {}. Process will not handle SIGTERM gracefully.", e);
 				return;
 			}
 		};
@@ -21,7 +21,7 @@ pub fn setup_signal_handlers() {
 		let mut sigint = match signal::unix::signal(signal::unix::SignalKind::interrupt()) {
 			Ok(stream) => stream,
 			Err(e) => {
-				eprintln!("Failed to setup SIGINT handler: {}", e);
+				warn!("Failed to setup SIGINT handler: {}. Process will not handle SIGINT gracefully.", e);
 				return;
 			}
 		};
@@ -29,11 +29,11 @@ pub fn setup_signal_handlers() {
 		tokio::select! {
 			_ = sigterm.recv() => {
 				debug!("Received SIGTERM, exiting gracefully...");
-				std::process::exit(130); // SIGTERM exit code
+				std::process::exit(143); // 128 + SIGTERM(15)
 			}
 			_ = sigint.recv() => {
 				debug!("Received SIGINT, exiting gracefully...");
-				std::process::exit(130); // SIGINT exit code
+				std::process::exit(130); // 128 + SIGINT(2)
 			}
 		}
 	});

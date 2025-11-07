@@ -98,7 +98,7 @@ fn render_header(frame: &mut Frame, area: Rect, state: &AppState) {
 			let progress_widget = Gauge::default()
 				.block(Block::default().borders(Borders::ALL).title(" Progress "))
 				.gauge_style(Style::default().fg(Color::Cyan))
-				.percent((ratio * 100.0) as u16)
+				.percent((ratio.clamp(0.0, 1.0) * 100.0) as u16)
 				.label(progress_text);
 			frame.render_widget(progress_widget, header_chunks[1]);
 		}
