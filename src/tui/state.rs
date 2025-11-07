@@ -191,21 +191,14 @@ pub struct UiState {
 
 /// Indicates which area of UI has focus
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum FocusArea {
 	Main,
-	Sidebar,
-	Input,
 }
 
-/// A log entry with timestamp and level
+/// A log entry with level and message
 #[derive(Debug, Clone)]
 pub struct LogEntry {
-	#[allow(dead_code)]
-	pub timestamp: Instant,
-	#[allow(dead_code)]
 	pub level: LogLevel,
-	#[allow(dead_code)]
 	pub message: String,
 }
 
@@ -272,7 +265,7 @@ impl AppState {
 
 	/// Add a log entry
 	pub fn add_log(&mut self, level: LogLevel, message: String) {
-		self.logs.push_back(LogEntry { timestamp: Instant::now(), level, message });
+		self.logs.push_back(LogEntry { level, message });
 
 		// Keep only last 1000 entries
 		while self.logs.len() > 1000 {
@@ -323,12 +316,6 @@ impl AppState {
 		self.ui.focus = FocusArea::Main;
 		self.ui.input_buffer.clear();
 		self.ui.cursor_pos = 0;
-	}
-
-	/// Get the elapsed time since sync started
-	#[allow(dead_code)]
-	pub fn elapsed(&self) -> Option<std::time::Duration> {
-		self.sync.start_time.map(|start| start.elapsed())
 	}
 }
 

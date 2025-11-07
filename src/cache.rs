@@ -4,7 +4,7 @@
 //! Uses simple mtime-based change detection.
 //! Also provides path-level locking to prevent concurrent syncs on same paths.
 
-use redb::{ReadableTable, TableDefinition};
+use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::path;
@@ -15,12 +15,19 @@ use crate::types::HashChunk;
 /// Cache entry for a single file
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheEntry {
+	#[serde(rename = "mt")]
 	pub mtime: u32,
+	#[serde(rename = "uid")]
 	pub uid: u32,
+	#[serde(rename = "gid")]
 	pub gid: u32,
+	#[serde(rename = "ct")]
 	pub ctime: u32,
+	#[serde(rename = "sz")]
 	pub size: u64,
+	#[serde(rename = "md")]
 	pub mode: u32,
+	#[serde(rename = "ch")]
 	pub chunks: Vec<HashChunk>,
 }
 
@@ -28,12 +35,16 @@ pub struct CacheEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LockInfo {
 	/// Process ID of the sync operation
+	#[serde(rename = "pid")]
 	pub pid: u32,
 	/// Unix timestamp when lock was acquired
+	#[serde(rename = "str")]
 	pub started: u64,
 	/// All paths being synced in this operation
+	#[serde(rename = "pth")]
 	pub paths: Vec<String>,
 	/// Remote nodes involved (e.g., "remote.example.com")
+	#[serde(rename = "nod")]
 	pub nodes: Vec<String>,
 }
 
@@ -67,17 +78,36 @@ const FILES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("files");
 const ACTIVE_SYNCS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("active_syncs");
 
 /// Check if a process with given PID is currently alive
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn is_process_alive(pid: u32) -> bool {
-	// Use kill -0 to check if process exists
-	// Returns 0 if process exists, -1 if doesn't
-	unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+	// On Linux, check if /proc/{pid} directory exists
+	// This is a safe alternative to the kill syscall
+	let proc_path_str = format!("/proc/{}", pid);
+	std::path::Path::new(&proc_path_str).exists()
 }
 
-#[cfg(not(unix))]
+#[cfg(target_os = "macos")]
+fn is_process_alive(pid: u32) -> bool {
+	// On macOS, check if /proc/{pid} exists (macOS 13.0+) or fallback to conservative approach
+	let proc_path_str = format!("/proc/{}", pid);
+	if std::path::Path::new(&proc_path_str).exists() {
+		return true;
+	}
+	// Fallback: assume alive if we can't determine (conservative approach)
+	// Could be improved with sysctl or other macOS-specific APIs
+	true
+}
+
+#[cfg(target_os = "windows")]
 fn is_process_alive(_pid: u32) -> bool {
-	// On non-Unix systems, assume process is alive (conservative approach)
-	// This could be improved with Windows API calls if needed
+	// On Windows, assume process is alive (conservative approach)
+	// Could be improved with Windows API calls if needed
+	true
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+fn is_process_alive(_pid: u32) -> bool {
+	// On other Unix-like systems, assume process is alive (conservative approach)
 	true
 }
 
@@ -162,7 +192,7 @@ impl ChildCache {
 		match table.get(rel_path)? {
 			Some(entry) => {
 				let bytes = entry.value().to_vec();
-				let cached: CacheEntry = bincode::deserialize(&bytes)?;
+				let cached: CacheEntry = json5::from_str(std::str::from_utf8(&bytes)?)?;
 				Ok(cached.mtime == current_mtime)
 			}
 			None => Ok(false),
@@ -185,7 +215,7 @@ impl ChildCache {
 		match table.get(rel_path)? {
 			Some(entry) => {
 				let bytes = entry.value().to_vec();
-				let cached: CacheEntry = bincode::deserialize(&bytes)?;
+				let cached: CacheEntry = json5::from_str(std::str::from_utf8(&bytes)?)?;
 				Ok(Some(cached.chunks))
 			}
 			None => Ok(None),
@@ -194,7 +224,7 @@ impl ChildCache {
 
 	/// Store or update cache entry for a file
 	pub fn set(&self, rel_path: &str, entry: CacheEntry) -> Result<(), Box<dyn Error>> {
-		let bytes = bincode::serialize(&entry)?;
+		let bytes = json5::to_string(&entry)?.into_bytes();
 
 		let write_txn = self.db.begin_write()?;
 		{
@@ -215,7 +245,7 @@ impl ChildCache {
 		match table.get(rel_path)? {
 			Some(entry) => {
 				let bytes = entry.value().to_vec();
-				let cached: CacheEntry = bincode::deserialize(&bytes)?;
+				let cached: CacheEntry = json5::from_str(std::str::from_utf8(&bytes)?)?;
 				Ok(Some(cached))
 			}
 			None => Ok(None),
@@ -285,7 +315,7 @@ impl ChildCache {
 				nodes: remote_nodes.to_vec(),
 			};
 
-			let lock_bytes = bincode::serialize(&lock_info)?;
+			let lock_bytes = json5::to_string(&lock_info)?.into_bytes();
 
 			// Acquire locks for all paths
 			for path in paths {
@@ -298,20 +328,6 @@ impl ChildCache {
 			db_path: self.db_path.clone(),
 			paths: paths.iter().map(|s| s.to_string()).collect(),
 		})
-	}
-
-	/// Release locks on specified paths
-	#[allow(dead_code)]
-	fn release_locks(&self, paths: &[String]) -> Result<(), Box<dyn Error>> {
-		let write_txn = self.db.begin_write()?;
-		{
-			let mut table = write_txn.open_table(ACTIVE_SYNCS_TABLE)?;
-			for path in paths {
-				table.remove(path.as_str())?;
-			}
-		}
-		write_txn.commit()?;
-		Ok(())
 	}
 
 	/// Check if a path is currently locked
@@ -331,7 +347,7 @@ impl ChildCache {
 		match table.get(path)? {
 			Some(entry) => {
 				let bytes = entry.value().to_vec();
-				let lock_info: LockInfo = bincode::deserialize(&bytes)?;
+				let lock_info: LockInfo = json5::from_str(std::str::from_utf8(&bytes)?)?;
 				Ok(Some(lock_info))
 			}
 			None => Ok(None),
@@ -353,7 +369,7 @@ impl ChildCache {
 				match iter.next() {
 					Some(Ok((key, entry))) => {
 						let bytes = entry.value().to_vec();
-						if let Ok(lock_info) = bincode::deserialize::<LockInfo>(&bytes) {
+						if let Ok(lock_info) = serde_json::from_slice::<LockInfo>(&bytes) {
 							if lock_info.is_stale() || lock_info.is_too_old() {
 								stale_keys.push(key.value().to_string());
 							}
@@ -571,7 +587,7 @@ mod tests {
 					paths: vec!["./stale_dir".to_string()],
 					nodes: vec![],
 				};
-				let bytes = bincode::serialize(&stale_lock).unwrap();
+				let bytes = json5::to_string(&stale_lock).unwrap().into_bytes();
 				table.insert("./stale_dir", bytes.as_slice()).unwrap();
 			}
 			write_txn.commit().unwrap();

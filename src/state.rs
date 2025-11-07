@@ -10,9 +10,11 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PreviousSyncState {
 	/// Files from previous sync, keyed by path
+	#[serde(rename = "fl")]
 	pub files: BTreeMap<String, FileData>,
 
 	/// Timestamp of previous sync
+	#[serde(rename = "ts")]
 	pub timestamp: u64,
 }
 
@@ -24,7 +26,6 @@ pub struct StateManager {
 
 impl StateManager {
 	/// Create a new state manager
-	#[allow(dead_code)]
 	pub fn new(state_dir: PathBuf, profile: &str) -> Self {
 		StateManager { state_dir, profile: profile.to_string() }
 	}
@@ -41,7 +42,7 @@ impl StateManager {
 			.await
 			.map_err(|e| StateError::LoadFailed { source: Box::new(e) })?;
 
-		serde_json::from_str(&contents).map_err(|e| StateError::Corrupted {
+		json5::from_str(&contents).map_err(|e| StateError::Corrupted {
 			message: format!("Failed to parse state JSON: {}", e),
 		})
 	}
@@ -57,8 +58,8 @@ impl StateManager {
 				.map_err(|e| StateError::SaveFailed { source: Box::new(e) })?;
 		}
 
-		let json = serde_json::to_string(state)
-			.map_err(|e| StateError::SaveFailed { source: Box::new(e) })?;
+		let json =
+			json5::to_string(state).map_err(|e| StateError::SaveFailed { source: Box::new(e) })?;
 
 		tokio::fs::write(&path, json)
 			.await

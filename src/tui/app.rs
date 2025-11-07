@@ -20,12 +20,16 @@ use super::{
 
 /// Commands sent from TUI to sync engine
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub enum TuiCommand {
+	#[allow(dead_code)]
 	StartSync,
+	#[allow(dead_code)]
 	PauseSync,
+	#[allow(dead_code)]
 	ResumeSync,
+	#[allow(dead_code)]
 	AbortSync,
+	#[allow(dead_code)]
 	ResolveConflict { conflict_id: u64, chosen_index: usize },
 }
 

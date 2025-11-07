@@ -59,7 +59,6 @@ impl std::fmt::Display for SyncPhase {
 
 /// Result of a sync operation
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct SyncResult {
 	/// Number of files successfully synced
 	pub files_synced: usize,
@@ -130,9 +129,9 @@ impl SerdeSerialize for HashChunk {
 	{
 		let hash_b64 = crate::util::hash_to_base64(&self.hash);
 		let mut state = serializer.serialize_struct("HashChunk", 3)?;
-		state.serialize_field("hash", &hash_b64)?;
-		state.serialize_field("offset", &self.offset)?;
-		state.serialize_field("size", &self.size)?;
+		state.serialize_field("h", &hash_b64)?;
+		state.serialize_field("of", &self.offset)?;
+		state.serialize_field("sz", &self.size)?;
 		state.end()
 	}
 }
@@ -146,8 +145,11 @@ impl<'de> Deserialize<'de> for HashChunk {
 
 		#[derive(Deserialize)]
 		struct HashChunkHelper {
+			#[serde(rename = "h")]
 			hash: String,
+			#[serde(rename = "of")]
 			offset: u64,
+			#[serde(rename = "sz")]
 			size: u32,
 		}
 
@@ -168,15 +170,25 @@ pub enum FileType {
 
 #[derive(Clone, PartialEq, Debug, Deserialize)]
 pub struct FileData {
+	#[serde(rename = "tp")]
 	pub tp: FileType,
+	#[serde(rename = "p")]
 	pub path: path::PathBuf,
+	#[serde(rename = "md")]
 	pub mode: u32,
+	#[serde(rename = "usr")]
 	pub user: u32,
+	#[serde(rename = "grp")]
 	pub group: u32,
+	#[serde(rename = "ct")]
 	pub ctime: u32,
+	#[serde(rename = "mt")]
 	pub mtime: u32,
+	#[serde(rename = "sz")]
 	pub size: u64,
+	#[serde(rename = "ch")]
 	pub chunks: Vec<HashChunk>,
+	#[serde(rename = "tgt")]
 	pub target: Option<path::PathBuf>,
 }
 
@@ -185,20 +197,29 @@ impl Serialize for FileData {
 	where
 		S: Serializer,
 	{
-		let mut state = serializer.serialize_struct("File", 2)?;
+		let mut state = serializer.serialize_struct("File", 10)?;
+		// Use short field names (max 3-4 chars)
 		match &self.tp {
-			FileType::File => state.serialize_field("type", "F")?,
-			FileType::SymLink => state.serialize_field("type", "L")?,
-			FileType::Dir => state.serialize_field("type", "D")?,
+			FileType::File => state.serialize_field("tp", "F")?,
+			FileType::SymLink => state.serialize_field("tp", "L")?,
+			FileType::Dir => state.serialize_field("tp", "D")?,
 		};
-		state.serialize_field("path", &self.path.to_str())?;
+		state.serialize_field("p", &self.path.to_str())?;
+		state.serialize_field("md", &self.mode)?;
+		state.serialize_field("usr", &self.user)?;
+		state.serialize_field("grp", &self.group)?;
+		state.serialize_field("ct", &self.ctime)?;
+		state.serialize_field("mt", &self.mtime)?;
+		state.serialize_field("sz", &self.size)?;
+		state.serialize_field("ch", &self.chunks)?;
+		state.serialize_field("tgt", &self.target)?;
 		state.end()
 	}
 }
 
 /// File operation type for tracking changes across syncs
-#[allow(dead_code)]
 #[derive(Clone, PartialEq, Debug)]
+#[allow(dead_code)]
 pub enum FileOperation {
 	Create,
 	Modify,

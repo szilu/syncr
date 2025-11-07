@@ -33,6 +33,9 @@
 //! }
 //! ```
 
+#![forbid(unsafe_code)]
+#![warn(dead_code)]
+
 pub mod cache;
 pub mod callbacks;
 pub mod chunking;

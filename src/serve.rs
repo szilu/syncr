@@ -97,15 +97,6 @@ fn validate_path(path: &path::Path) -> Result<(), Box<dyn Error>> {
 	Ok(())
 }
 
-#[allow(dead_code)]
-fn tmp_filename(path: &path::Path) -> path::PathBuf {
-	let mut filepath = path::PathBuf::from(path);
-	let mut filename = path.file_name().expect("Protocol error!").to_os_string();
-	filename.push(".SyNcR-TmP");
-	filepath.set_file_name(filename);
-	filepath
-}
-
 //////////
 // List //
 //////////
@@ -309,9 +300,9 @@ fn traverse_dir<'a>(state: &'a mut DumpState, dir: path::PathBuf) -> BoxedAsyncR
 							size: count as u32,
 						});
 
-						unsafe {
-							std::ptr::copy(buf[count..].as_mut_ptr(), buf.as_mut_ptr(), n - count);
-						}
+						// Shift remaining unprocessed bytes to the front of the buffer
+						// Safe alternative to unsafe ptr::copy
+						buf.copy_within(count..n, 0);
 						offset += count as u64;
 						n -= count;
 					} else {
@@ -469,7 +460,7 @@ async fn serve_read(dir: path::PathBuf, dump_state: &DumpState) -> Result<(), Bo
 			let mut buf: Vec<u8> = vec![0; fc.size];
 			f.seek(io::SeekFrom::Start(fc.offset)).await?;
 			f.read_exact(&mut buf).await?;
-			let encoded = general_purpose::STANDARD.encode(buf);
+			let encoded = general_purpose::URL_SAFE.encode(buf);
 			protocol_println!("C:{}", chunk);
 			for line in encoded.into_bytes().chunks(config::BASE64_LINE_LENGTH) {
 				write_stdout(line)?;
@@ -627,7 +618,7 @@ async fn serve_write(dir: path::PathBuf, dump_state: &DumpState) -> Result<(), B
 						break;
 					}
 					//eprintln!("DECODE: [{:?}]", &buf.trim());
-					chunk.append(&mut general_purpose::STANDARD.decode(buf.trim())?);
+					chunk.append(&mut general_purpose::URL_SAFE.decode(buf.trim())?);
 				}
 				//eprintln!("DECODED CHUNK: {:?}", chunk);
 				let fc_vec_opt = {

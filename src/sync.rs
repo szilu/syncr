@@ -198,16 +198,17 @@ pub mod phases {
 	use crate::types::SyncResult;
 
 	/// Represents an active sync session with control over individual phases
-	#[allow(dead_code)]
 	pub struct SyncSession {
+		#[allow(dead_code)]
 		nodes: Vec<connection::Node>,
 		collected: bool,
+		#[allow(dead_code)]
 		conflicts_detected: Vec<ConflictInfo>,
 	}
 
 	#[derive(Debug, Clone)]
-	#[allow(dead_code)]
 	struct ConflictInfo {
+		#[allow(dead_code)]
 		path: String,
 	}
 

@@ -13,31 +13,12 @@ pub fn hash_binary(buf: &[u8]) -> [u8; 32] {
 
 /// Convert binary hash to base64 string (for protocol transmission)
 pub fn hash_to_base64(hash: &[u8; 32]) -> String {
-	base64::engine::general_purpose::STANDARD.encode(hash)
-}
-
-/// Convert binary hash to base64url string (filesystem-safe, RFC 4648)
-/// Replaces "/" with "-" and "+" with "_" for safe filenames
-#[allow(dead_code)]
-pub fn hash_to_base64url(hash: &[u8; 32]) -> String {
 	base64::engine::general_purpose::URL_SAFE.encode(hash)
 }
 
 /// Convert base64 string to binary hash
 pub fn base64_to_hash(b64: &str) -> Result<[u8; 32], Box<dyn std::error::Error>> {
-	let bytes = base64::engine::general_purpose::STANDARD.decode(b64)?;
-	if bytes.len() != 32 {
-		return Err(format!("Hash must be 32 bytes, got {}", bytes.len()).into());
-	}
-	let mut hash = [0u8; 32];
-	hash.copy_from_slice(&bytes);
-	Ok(hash)
-}
-
-/// Convert base64url string to binary hash
-#[allow(dead_code)]
-pub fn base64url_to_hash(b64url: &str) -> Result<[u8; 32], Box<dyn std::error::Error>> {
-	let bytes = base64::engine::general_purpose::URL_SAFE.decode(b64url)?;
+	let bytes = base64::engine::general_purpose::URL_SAFE.decode(b64)?;
 	if bytes.len() != 32 {
 		return Err(format!("Hash must be 32 bytes, got {}", bytes.len()).into());
 	}

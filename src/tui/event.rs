@@ -45,7 +45,6 @@ pub enum TuiEvent {
 
 /// Events from the sync engine bridge
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub enum SyncEvent {
 	/// Sync phase started
 	PhaseStarted { phase: SyncPhase },
@@ -54,6 +53,7 @@ pub enum SyncEvent {
 	PhaseCompleted { phase: SyncPhase },
 
 	/// Sync phase changed (legacy)
+	#[allow(dead_code)]
 	PhaseChanged { phase: SyncPhase },
 
 	/// Progress update with statistics
@@ -63,6 +63,7 @@ pub enum SyncEvent {
 	NodeConnected { index: usize, location: String },
 
 	/// Node connection failed
+	#[allow(dead_code)]
 	NodeConnectionFailed { index: usize, location: String, error: String },
 
 	/// Node ready after handshake
@@ -90,21 +91,29 @@ pub enum SyncEvent {
 	},
 
 	/// File synchronized between nodes
+	#[allow(dead_code)]
 	FileSync { path: PathBuf, from_node: usize, to_nodes: Vec<usize> },
 
 	/// File deleted from a node
+	#[allow(dead_code)]
 	FileDelete { path: PathBuf, node: usize },
 
 	/// Directory created on a node
+	#[allow(dead_code)]
 	DirCreate { path: PathBuf, node: usize },
 
 	/// Conflict detected (needs resolution)
-	ConflictDetected { path: PathBuf, description: String },
+	ConflictDetected {
+		path: PathBuf,
+		#[allow(dead_code)]
+		description: String,
+	},
 
 	/// Conflict resolved
 	ConflictResolved { path: PathBuf, winner: Option<usize> },
 
 	/// Non-fatal error occurred during sync
+	#[allow(dead_code)]
 	Error { error: String },
 
 	/// Tracing log message from parent process

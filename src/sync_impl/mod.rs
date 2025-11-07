@@ -27,7 +27,6 @@ use crate::utils::{setup_signal_handlers, TerminalGuard};
 
 /// Progress statistics for callbacks
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct ProgressUpdate {
 	pub phase: SyncPhase,
 	pub files_processed: usize,
@@ -39,7 +38,6 @@ pub struct ProgressUpdate {
 
 /// Comprehensive sync event type covering all callback needs
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub enum SyncCallbackEvent {
 	/// Phase lifecycle: phase name and is_starting (true) or completing (false)
 	PhaseChanged {
@@ -61,7 +59,6 @@ pub enum SyncCallbackEvent {
 		location: String,
 	},
 
-	#[allow(dead_code)]
 	NodeDisconnecting {
 		node_id: usize,
 	},
@@ -184,7 +181,7 @@ async fn load_previous_state(config: &Config) -> Result<Option<PreviousSyncState
 
 	// Try to read and parse the state
 	let contents = afs::read_to_string(&state_file).await?;
-	let file_map: BTreeMap<String, FileData> = serde_json::from_str(&contents)?;
+	let file_map: BTreeMap<String, FileData> = json5::from_str(&contents)?;
 
 	// Get current timestamp
 	let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
@@ -201,7 +198,6 @@ pub struct ConflictResolution {
 /// Sync with callbacks for progress and event notification
 /// If conflict_rx is provided, the sync will wait for conflict resolutions from the channel
 /// instead of prompting on stdin
-#[allow(dead_code)]
 pub async fn sync_with_callbacks(
 	config: Config,
 	dirs: Vec<&str>,
@@ -211,7 +207,6 @@ pub async fn sync_with_callbacks(
 	sync_impl(config, dirs, Some(callbacks), conflict_rx).await
 }
 
-#[allow(dead_code)]
 pub async fn sync(config: Config, dirs: Vec<&str>) -> Result<(), Box<dyn Error>> {
 	sync_impl(config, dirs, None, None).await?;
 	Ok(())
@@ -954,11 +949,11 @@ async fn run_sync_logic(
 		json.push('"');
 		json.push_str(&file.to_str().unwrap());
 		json.push_str("\":");
-		json.push_str(serde_json::to_string(state.nodes[node as usize].dir.get(&file).unwrap()).unwrap().as_str());
+		json.push_str(json5::to_string(state.nodes[node as usize].dir.get(&file).unwrap()).unwrap().as_str());
 	}
 	*/
-	let json = serde_json::to_string(&tree)
-		.map_err(|e| format!("Failed to serialize state to JSON: {}", e))?;
+	let json =
+		json5::to_string(&tree).map_err(|e| format!("Failed to serialize state to JSON: {}", e))?;
 	debug!("JSON: {}", json);
 	let fname = config.syncr_dir.clone().join("test.profile.json");
 	let mut f = afs::File::create(&fname).await?;
