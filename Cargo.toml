@@ -16,6 +16,7 @@ clap = "4.5"
 futures = "0.3"
 glob = "0.3"
 hex = "0.4"
+libc = "0.2"
 redb = "2.6"
 rollsum = "0.3"
 serde = { version = "1.0", features = ["derive"] }

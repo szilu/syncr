@@ -13,12 +13,13 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
 // Use the old connect module directly (not the new connection.rs library API)
+use crate::cache::ChildCache;
 use crate::connect;
 use crate::logging::*;
 #[allow(unused_imports)]
 use crate::metadata_utils;
 use crate::types::{Config, FileData, PreviousSyncState, SyncPhase};
-use crate::utils::{setup_signal_handlers, FileLock, TerminalGuard};
+use crate::utils::{setup_signal_handlers, TerminalGuard};
 
 //////////
 // Callbacks trait for sync progress notification //
@@ -374,9 +375,29 @@ pub async fn sync_impl(
 	// Setup signal handlers for graceful cleanup
 	setup_signal_handlers();
 
-	// Acquire lock to prevent concurrent sync operations
-	info!("Acquiring lock...");
-	let _lock = FileLock::acquire(&config.syncr_dir)?;
+	// Acquire path-level locks to prevent concurrent syncs on same paths
+	info!("Acquiring path-level locks...");
+	let cache_db_path = config.syncr_dir.join("cache.db");
+	let cache = ChildCache::open(&cache_db_path)?;
+
+	// Extract remote nodes from paths
+	let remote_nodes: Vec<String> = dirs
+		.iter()
+		.filter(|dir| {
+			dir.contains(':')
+				&& !dir.starts_with('/')
+				&& !dir.starts_with('.')
+				&& !dir.starts_with('~')
+		})
+		.map(|dir| {
+			// Extract host from "user@host:path" or "host:path"
+			dir.split(':').next().unwrap_or("").to_string()
+		})
+		.collect::<std::collections::BTreeSet<_>>()
+		.into_iter()
+		.collect();
+
+	let _path_locks = cache.acquire_locks(&dirs, &remote_nodes)?;
 
 	let mut state = SyncState { nodes: Vec::new() };
 	let mut metrics = SyncMetrics::default();
