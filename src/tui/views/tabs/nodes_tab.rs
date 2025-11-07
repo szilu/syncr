@@ -154,7 +154,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
 
 		lines.push(Line::from(vec![
 			Span::styled(format!("  {} ", status), Style::default().fg(status_color)),
-			Span::styled(&node.location, Style::default().add_modifier(Modifier::BOLD)),
+			Span::styled(&node.label, Style::default().add_modifier(Modifier::BOLD)),
 		]));
 
 		// Show three separate statistics

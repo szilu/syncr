@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use super::event::ProgressStats;
+use crate::node_labels::generate_node_labels;
 use crate::types::{Config, SyncPhase, SyncResult};
 
 /// Main application state
@@ -132,6 +133,8 @@ pub struct ConflictEntry {
 	pub path: PathBuf,
 	/// Which node's version was chosen (None = not resolved yet)
 	pub resolution: Option<usize>,
+	/// Modification times for each node's version (for display grouping)
+	pub node_mtimes: Option<Vec<Option<u32>>>,
 }
 
 /// Information about a single sync node
@@ -139,7 +142,9 @@ pub struct ConflictEntry {
 pub struct NodeInfo {
 	#[allow(dead_code)]
 	pub index: usize,
+	#[allow(dead_code)]
 	pub location: String,
+	pub label: String, // Smart concise label for display
 	pub connected: bool,
 	pub error: Option<String>,
 
@@ -218,6 +223,10 @@ impl AppState {
 	pub fn new(config: Config, locations: Vec<String>) -> Self {
 		let node_count = locations.len();
 
+		// Generate smart labels for nodes
+		let labels =
+			generate_node_labels(&locations.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+
 		AppState {
 			current_view: ViewType::Setup,
 			sync: SyncState {
@@ -227,6 +236,7 @@ impl AppState {
 					.map(|i| NodeInfo {
 						index: i,
 						location: locations[i].clone(),
+						label: labels[i].clone(),
 						connected: false,
 						error: None,
 						files_collected: 0,

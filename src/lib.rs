@@ -44,6 +44,7 @@ pub mod conflict;
 pub mod connection;
 pub mod error;
 pub mod metadata_utils;
+pub mod node_labels;
 pub mod protocol_utils;
 pub mod state;
 pub mod sync;

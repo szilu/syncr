@@ -29,13 +29,20 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState) {
 		)));
 		lines.push(Line::from(""));
 
-		// Column headers (node numbers)
+		// Column headers (node labels)
 		if node_count > 0 {
 			let mut header_spans =
 				vec![Span::raw("File Path                                      ")];
-			for i in 0..node_count {
-				header_spans
-					.push(Span::styled(format!(" N{} ", i + 1), Style::default().fg(Color::Cyan)));
+			for node in &state.sync.nodes {
+				let label_short = if node.label.len() > 4 {
+					node.label[..4].to_string()
+				} else {
+					node.label.clone()
+				};
+				header_spans.push(Span::styled(
+					format!(" {:>4} ", label_short),
+					Style::default().fg(Color::Cyan),
+				));
 			}
 			lines.push(Line::from(header_spans));
 			lines.push(Line::from("─".repeat(area.width as usize)));

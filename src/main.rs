@@ -10,6 +10,7 @@ mod conflict;
 mod connect;
 mod logging;
 mod metadata_utils;
+mod node_labels;
 mod progress;
 mod protocol_utils;
 mod serve;

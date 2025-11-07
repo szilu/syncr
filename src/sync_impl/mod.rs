@@ -93,6 +93,8 @@ pub enum SyncCallbackEvent {
 		is_detected: bool, // true for detected, false for resolved
 		num_versions: usize,
 		winner: Option<usize>, // Some(node_id) if resolved
+		/// Modification times for each node's version (None = file doesn't exist on that node)
+		node_mtimes: Option<Vec<Option<u32>>>,
 	},
 }
 
@@ -216,8 +218,8 @@ pub async fn sync(config: Config, dirs: Vec<&str>) -> Result<(), Box<dyn Error>>
 pub async fn sync_with_cli_progress(config: Config, dirs: Vec<&str>) -> Result<(), Box<dyn Error>> {
 	eprintln!("Starting sync with progress display...");
 
-	// Create callback for progress display only
-	let callback = crate::progress::CliProgressCallback::new();
+	// Create callback for progress display with smart node labels
+	let callback = crate::progress::CliProgressCallback::with_addresses(dirs.clone());
 
 	// No conflict channel - conflicts will be skipped
 	sync_impl(config, dirs, Some(Box::new(callback)), None).await?;
@@ -241,7 +243,9 @@ impl ConflictPrompt {
 
 impl SyncProgressCallback for ConflictPrompt {
 	fn on_event(&self, event: SyncCallbackEvent) {
-		if let SyncCallbackEvent::Conflict { path, is_detected, num_versions, winner: _ } = event {
+		if let SyncCallbackEvent::Conflict { path, is_detected, num_versions, winner: _, .. } =
+			event
+		{
 			if is_detected {
 				// Clear progress line and show conflict
 				eprintln!();
@@ -344,8 +348,9 @@ pub async fn sync_with_progress_and_conflicts(
 	// Create a channel for conflict resolution
 	let (conflict_tx, conflict_rx) = std::sync::mpsc::channel();
 
-	// Create progress callback
-	let progress_callback = Box::new(crate::progress::CliProgressCallback::new());
+	// Create progress callback with smart node labels
+	let progress_callback =
+		Box::new(crate::progress::CliProgressCallback::with_addresses(dirs.clone()));
 
 	// Create conflict callback
 	let conflict_callback = Box::new(ConflictPrompt::new(conflict_tx));
@@ -709,6 +714,12 @@ async fn run_sync_logic(
 							is_detected: true,
 							num_versions: files.len(),
 							winner: None,
+							node_mtimes: Some(
+								original_files
+									.iter()
+									.map(|file_opt| file_opt.map(|f| f.mtime))
+									.collect(),
+							),
 						});
 					}
 

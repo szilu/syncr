@@ -11,6 +11,7 @@ use std::sync::Mutex;
 use std::time::Instant;
 use tracing::info;
 
+use crate::node_labels::generate_node_labels;
 use crate::sync_impl::{SyncCallbackEvent, SyncProgressCallback};
 use crate::types::SyncPhase;
 
@@ -53,12 +54,19 @@ impl Default for ProgressState {
 /// CLI progress callback - displays sync progress without conflict handling
 pub struct CliProgressCallback {
 	state: ProgressState,
+	node_labels: Vec<String>,
 }
 
 impl CliProgressCallback {
 	/// Create a new progress callback
 	pub fn new() -> Self {
-		Self { state: ProgressState::new() }
+		Self { state: ProgressState::new(), node_labels: Vec::new() }
+	}
+
+	/// Create a progress callback with smart node labels
+	pub fn with_addresses(addresses: Vec<&str>) -> Self {
+		let labels = generate_node_labels(&addresses);
+		Self { state: ProgressState::new(), node_labels: labels }
 	}
 }
 
@@ -114,9 +122,14 @@ impl SyncProgressCallback for CliProgressCallback {
 						nodes.sort_by_key(|&(node_id, _)| node_id);
 
 						for (node_id, node_stat) in nodes {
+							let label = if *node_id < self.node_labels.len() {
+								self.node_labels[*node_id].clone()
+							} else {
+								format!("N{}", node_id)
+							};
 							node_strs.push(format!(
-								"N{}: {}f/{:.1}MB",
-								node_id,
+								"{}: {}f/{:.1}MB",
+								label,
 								node_stat.files,
 								node_stat.bytes as f64 / BYTES_PER_MB
 							));

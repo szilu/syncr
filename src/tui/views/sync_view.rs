@@ -175,7 +175,7 @@ fn render_node_status(frame: &mut Frame, area: Rect, state: &AppState) {
 
 		lines.push(Line::from(vec![
 			Span::styled(format!("  {} ", status), Style::default().fg(status_color)),
-			Span::raw(&node.location),
+			Span::raw(&node.label),
 		]));
 
 		// Show three separate statistics

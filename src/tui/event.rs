@@ -107,6 +107,8 @@ pub enum SyncEvent {
 		path: PathBuf,
 		#[allow(dead_code)]
 		description: String,
+		/// Modification times for each node's version
+		node_mtimes: Option<Vec<Option<u32>>>,
 	},
 
 	/// Conflict resolved

@@ -356,17 +356,18 @@ impl TuiApp {
 				self.state.add_log(LogLevel::Info, msg);
 			}
 
-			SyncEvent::ConflictDetected { path, description: _ } => {
+			SyncEvent::ConflictDetected { path, description: _, node_mtimes } => {
 				use crate::tui::state::{ConflictEntry, TabType};
 
 				self.state
 					.add_log(LogLevel::Warning, format!("Conflict detected: {}", path.display()));
 
 				// Add conflict to the list
-				self.state
-					.sync
-					.conflicts
-					.push(ConflictEntry { path: path.clone(), resolution: None });
+				self.state.sync.conflicts.push(ConflictEntry {
+					path: path.clone(),
+					resolution: None,
+					node_mtimes,
+				});
 
 				// Auto-select first conflict if none selected
 				if self.state.sync.selected_conflict_index.is_none() {

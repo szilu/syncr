@@ -99,11 +99,18 @@ impl crate::sync_impl::SyncProgressCallback for TuiBridge {
 				}
 			}
 
-			SyncCallbackEvent::Conflict { path, is_detected, num_versions, winner } => {
+			SyncCallbackEvent::Conflict {
+				path,
+				is_detected,
+				num_versions,
+				winner,
+				node_mtimes,
+			} => {
 				if is_detected {
 					self.send_event(SyncEvent::ConflictDetected {
 						path: std::path::PathBuf::from(path),
 						description: format!("{} versions detected", num_versions),
+						node_mtimes,
 					});
 				} else {
 					self.send_event(SyncEvent::ConflictResolved {
