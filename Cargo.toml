@@ -1,6 +1,6 @@
 [package]
 name = "syncr"
-version = "0.1.0"
+version = "0.3.0"
 authors = ["Szilard Hajba <szilu@symbion.hu>"]
 edition = "2018"
 
@@ -9,6 +9,7 @@ default = []
 tui = ["ratatui", "crossterm"]
 
 [dependencies]
+async-trait = "0.1"
 base64 = "0.22"
 blake3 = "1.8"
 clap = "4.5"
@@ -20,6 +21,7 @@ redb = "3.1"
 rollsum = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sysinfo = "0.37"
 termios = "0.3"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"

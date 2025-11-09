@@ -12,6 +12,7 @@ pub const MAX_CHUNK_SIZE_FACTOR: usize = 16;
 pub const MAX_CHUNK_SIZE: usize = (1 << CHUNK_BITS) * MAX_CHUNK_SIZE_FACTOR;
 
 /// Base64 line length for output
+#[allow(dead_code)]
 pub const BASE64_LINE_LENGTH: usize = 64;
 
 // Alias for new API (may be used by library users)

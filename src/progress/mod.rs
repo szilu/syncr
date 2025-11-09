@@ -81,10 +81,12 @@ impl SyncProgressCallback for CliProgressCallback {
 		match event {
 			SyncCallbackEvent::PhaseChanged { phase, is_starting } => {
 				if is_starting {
-					*self.state.current_phase.lock().unwrap() = Some(phase);
+					*self.state.current_phase.lock().unwrap_or_else(|e| e.into_inner()) =
+						Some(phase);
 					// Reset collection stats for new phase
 					if !matches!(phase, SyncPhase::Collecting) {
-						*self.state.node_stats.lock().unwrap() = HashMap::new();
+						*self.state.node_stats.lock().unwrap_or_else(|e| e.into_inner()) =
+							HashMap::new();
 					}
 					// Log phase change
 					let phase_name = format!("{:?}", phase);
@@ -97,7 +99,8 @@ impl SyncProgressCallback for CliProgressCallback {
 					if matches!(phase.as_ref(), Some(SyncPhase::Collecting)) {
 						// Update per-node stats
 						{
-							let mut stats = self.state.node_stats.lock().unwrap();
+							let mut stats =
+								self.state.node_stats.lock().unwrap_or_else(|e| e.into_inner());
 							stats.insert(
 								node_id,
 								NodeCollectionStats { files: files_known, bytes: bytes_known },
@@ -105,7 +108,8 @@ impl SyncProgressCallback for CliProgressCallback {
 						} // Drop lock before throttle check
 
 						// Throttle updates to every 100ms
-						let mut last = self.state.last_update.lock().unwrap();
+						let mut last =
+							self.state.last_update.lock().unwrap_or_else(|e| e.into_inner());
 						let elapsed = last.elapsed().as_millis();
 						if elapsed < 100 {
 							return;
@@ -114,7 +118,7 @@ impl SyncProgressCallback for CliProgressCallback {
 						drop(last);
 
 						// Display per-node stats on one line
-						let stats = self.state.node_stats.lock().unwrap();
+						let stats = self.state.node_stats.lock().unwrap_or_else(|e| e.into_inner());
 						let mut node_strs = Vec::new();
 
 						// Collect and sort nodes
@@ -143,7 +147,7 @@ impl SyncProgressCallback for CliProgressCallback {
 			}
 			SyncCallbackEvent::Progress(update) => {
 				// Throttle updates to every 100ms to avoid spamming
-				let mut last = self.state.last_update.lock().unwrap();
+				let mut last = self.state.last_update.lock().unwrap_or_else(|e| e.into_inner());
 				let elapsed = last.elapsed().as_millis();
 				if elapsed < 100 {
 					return;

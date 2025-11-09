@@ -12,6 +12,7 @@ mod logging;
 mod metadata_utils;
 mod node_labels;
 mod progress;
+mod protocol;
 mod protocol_utils;
 mod serve;
 pub mod sync_impl; // Sync implementation (types are public for callbacks)
@@ -59,7 +60,7 @@ fn init_syncr_dir() -> Result<path::PathBuf, Box<dyn Error>> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
 	let matches = Command::new("SyncR")
-		.version("0.1.0")
+		.version(env!("CARGO_PKG_VERSION"))
 		.author("Szilard Hajba <szilard@symbion.hu>")
 		.about("2-way directory sync utility")
 		.subcommand_required(true)
@@ -108,6 +109,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
 					Arg::new("skip-conflicts")
 						.long("skip-conflicts")
 						.help("Skip conflicts instead of prompting for resolution")
+						.action(ArgAction::SetTrue),
+				),
+		)
+		.subcommand(
+			Command::new("unlock")
+				.about("Release locks on paths (dangerous, use with caution!)")
+				.arg(Arg::new("path").required(true).help("Path to unlock"))
+				.arg(
+					Arg::new("force")
+						.long("force")
+						.help("Force unlock even if process appears alive")
 						.action(ArgAction::SetTrue),
 				),
 		)
@@ -185,6 +197,59 @@ async fn main() -> Result<(), Box<dyn Error>> {
 			// Default mode: interactive conflict resolution, no progress display
 			// (will still show logs if verbosity is set)
 			sync_impl::sync_with_conflicts(config, dirs).await?;
+		}
+	} else if let Some(unlock_matches) = matches.subcommand_matches("unlock") {
+		// Unlock mode
+		logging::init_tracing();
+
+		let config = Config {
+			syncr_dir: init_syncr_dir()?,
+			profile: matches
+				.get_one::<String>("profile")
+				.map(|s| s.as_str())
+				.unwrap_or("default")
+				.to_string(),
+		};
+
+		let path = unlock_matches
+			.get_one::<String>("path")
+			.ok_or("unlock: path argument required")?;
+		let force = unlock_matches.get_flag("force");
+
+		// Open the cache database for the default profile
+		let db_path = config.syncr_dir.join(format!("{}.db", config.profile));
+		let cache = cache::ChildCache::open(&db_path)?;
+
+		// Get lock info before removing
+		if let Ok(Some(lock_info)) = cache.get_lock_info(path) {
+			info!(
+				"Lock found for '{}': PID {}, started {}",
+				path, lock_info.pid, lock_info.started
+			);
+
+			// Check if lock is stale or force is set
+			if force {
+				info!("Force unlocking path: {}", path);
+			} else if lock_info.is_stale() {
+				info!("Lock is stale (process {} is dead), removing it", lock_info.pid);
+			} else {
+				return Err(format!(
+					"Cannot unlock '{}': locked by active process {} (PID). Use --force to override.",
+					path, lock_info.pid
+				)
+				.into());
+			}
+
+			// Remove the lock from the database
+			let write_txn = cache.db.begin_write()?;
+			{
+				let mut table = write_txn.open_table(cache::ACTIVE_SYNCS_TABLE)?;
+				table.remove(path.as_str())?;
+			}
+			write_txn.commit()?;
+			info!("Successfully unlocked path: {}", path);
+		} else {
+			info!("No lock found for path: {}", path);
 		}
 	}
 

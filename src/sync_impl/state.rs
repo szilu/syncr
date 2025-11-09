@@ -3,20 +3,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::path;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
-use crate::metadata_utils;
-use crate::protocol_utils;
+use crate::protocol::{FileSystemEntryType, SyncProtocol};
 use crate::types::{FileData, FileType};
-
-use super::protocol::{log_trace_message, parse_trace_message};
 
 /// State for a single sync node (local or remote)
 pub struct NodeState {
 	pub id: u8,
-	pub send: Mutex<tokio::process::ChildStdin>,
-	pub recv: Mutex<BufReader<tokio::process::ChildStdout>>,
+	pub protocol: Mutex<Box<dyn SyncProtocol>>,
 	pub dir: BTreeMap<path::PathBuf, Box<FileData>>,
 	pub chunks: BTreeSet<[u8; 32]>,       // Binary BLAKE3 hashes
 	pub missing: Mutex<BTreeSet<String>>, // Base64-encoded hashes needing transfer
@@ -34,97 +29,39 @@ impl NodeState {
 		file: &FileData,
 		trans_data: bool,
 	) -> Result<(), Box<dyn Error>> {
-		let mut sender = self.send.lock().await;
-		match file.tp {
-			FileType::File => {
-				if trans_data {
-					let msg = format!(
-						"FD:{}:{}:{}:{}:{}:{}:{}",
-						file.path.to_string_lossy(),
-						file.mode,
-						file.user,
-						file.group,
-						file.ctime,
-						file.mtime,
-						file.size
-					);
-					sender.write_all(format!("{}\n", msg).as_bytes()).await?;
-					for chunk in &file.chunks {
-						let hash_b64 = crate::util::hash_to_base64(&chunk.hash);
-						if !self.chunks.contains(&chunk.hash) {
-							// Chunk needs transfer
-							let msg = format!("RC:{}:{}:{}", chunk.offset, chunk.size, hash_b64);
-							sender.write_all(format!("{}\n", msg).as_bytes()).await?;
-							self.missing.lock().await.insert(hash_b64);
-						} else {
-							// Chunk is available locally
-							let msg = format!("LC:{}:{}:{}", chunk.offset, chunk.size, hash_b64);
-							sender.write_all(format!("{}\n", msg).as_bytes()).await?;
-						}
-					}
-					sender.write_all(b".\n").await?;
-				} else {
-					let msg = format!(
-						"FM:{}:{}:{}:{}:{}:{}:{}",
-						file.path.to_string_lossy(),
-						file.mode,
-						file.user,
-						file.group,
-						file.ctime,
-						file.mtime,
-						file.size
-					);
-					sender.write_all(format!("{}\n", msg).as_bytes()).await?;
-				}
-			}
-			FileType::SymLink => {
-				let target = file
-					.target
-					.as_ref()
-					.map(|p| p.to_string_lossy().to_string())
-					.unwrap_or_default();
-				let msg = format!(
-					"L:{}:{}:{}:{}:{}:{}:{}",
-					file.path.to_string_lossy(),
-					file.mode,
-					file.user,
-					file.group,
-					file.ctime,
-					file.mtime,
-					target
-				);
-				sender
-					.write_all(
-						format!(
-							"{}
-",
-							msg
-						)
-						.as_bytes(),
-					)
-					.await?;
-			}
-			FileType::Dir => {
-				let msg = format!(
-					"D:{}:{}:{}:{}:{}:{}",
-					file.path.to_string_lossy(),
-					file.mode,
-					file.user,
-					file.group,
-					file.ctime,
-					file.mtime
-				);
-				sender.write_all(format!("{}\n", msg).as_bytes()).await?;
-			}
-		}
-		sender.flush().await?;
-		Ok(())
-	}
+		use crate::protocol::{ChunkInfo, MetadataEntry};
 
-	pub async fn send(&self, buf: &str) -> Result<(), Box<dyn Error>> {
-		let mut sender = self.send.lock().await;
-		sender.write_all([buf, "\n"].concat().as_bytes()).await?;
-		sender.flush().await?;
+		let entry_type = match file.tp {
+			FileType::File => FileSystemEntryType::File,
+			FileType::Dir => FileSystemEntryType::Directory,
+			FileType::SymLink => FileSystemEntryType::SymLink,
+		};
+
+		let chunks = file
+			.chunks
+			.iter()
+			.map(|c| ChunkInfo { hash: c.hash, offset: c.offset, size: c.size })
+			.collect();
+
+		let metadata = MetadataEntry {
+			entry_type,
+			path: file.path.clone(),
+			mode: file.mode,
+			user_id: file.user,
+			group_id: file.group,
+			created_time: file.ctime,
+			modified_time: file.mtime,
+			size: file.size,
+			target: file.target.clone(),
+			chunks,
+			needs_data_transfer: trans_data,
+		};
+
+		let mut protocol = self.protocol.lock().await;
+		protocol
+			.send_metadata(&metadata)
+			.await
+			.map_err(|e| Box::new(e) as Box<dyn Error>)?;
 		Ok(())
 	}
 
@@ -132,71 +69,88 @@ impl NodeState {
 	where
 		F: FnMut(usize, u64),
 	{
-		let mut buf = String::new();
-		let mut file_data: Option<&mut Box<FileData>> = None;
+		let mut current_file: Option<path::PathBuf> = None;
 		let mut files_count = 0;
 		let mut bytes_count = 0u64;
 		let mut last_update = std::time::Instant::now();
 
-		// Note: Handshake already consumed the initialization "." message,
-		// so we don't need to read it again here. Just send LIST directly.
-		self.send.lock().await.write_all(b"LIST\n").await?;
-		self.send.lock().await.flush().await?;
+		// Request directory listing
+		{
+			let mut protocol = self.protocol.lock().await;
+			protocol.request_listing().await.map_err(|e| Box::new(e) as Box<dyn Error>)?;
+		}
+
+		// Receive entries
 		loop {
-			buf.clear();
-			self.recv.lock().await.read_line(&mut buf).await?;
-			if buf.trim() == "." {
-				break;
-			}
-			//println!("[{}]LINE: {}", self.id, buf.trim());
+			let entry_opt = {
+				let mut protocol = self.protocol.lock().await;
+				protocol.receive_entry().await.map_err(|e| Box::new(e) as Box<dyn Error>)?
+			};
 
-			// Check for trace messages from child (format: #<LEVEL>:<msg> or !<LEVEL>:<msg>)
-			if let Some((level, message)) = parse_trace_message(buf.trim()) {
-				log_trace_message(level, &message, self.id);
-				continue; // Skip protocol parsing for trace messages
-			}
+			let Some(entry) = entry_opt else {
+				break; // End of listing
+			};
 
-			// Skip empty lines
-			if buf.trim().is_empty() {
-				continue;
-			}
+			match entry.entry_type {
+				FileSystemEntryType::File => {
+					// If this is a file with chunk data (not just a chunk reference)
+					if !entry.path.as_os_str().is_empty() {
+						let fd = Box::new(FileData {
+							path: entry.path.clone(),
+							tp: FileType::File,
+							mode: entry.mode,
+							user: entry.user_id,
+							group: entry.group_id,
+							ctime: entry.created_time,
+							mtime: entry.modified_time,
+							size: entry.size,
+							chunks: Vec::new(),
+							target: None,
+						});
 
-			let fields = protocol_utils::parse_protocol_line(&buf, 1)?;
-			let cmd = fields[0];
+						bytes_count += fd.size;
+						files_count += 1;
+						self.dir.insert(entry.path.clone(), fd);
+						current_file = Some(entry.path.clone());
 
-			match cmd {
-				"F" => {
-					let fd = metadata_utils::parse_file_metadata(&buf)?;
-					let path = fd.path.clone();
-					bytes_count += fd.size;
-					files_count += 1;
-					self.dir.insert(fd.path.clone(), fd);
-					file_data = self.dir.get_mut(&path);
-
-					// Send progress update every 100 files or every 200ms
-					if files_count % 100 == 0 || last_update.elapsed().as_millis() >= 200 {
-						progress_callback(files_count, bytes_count);
-						last_update = std::time::Instant::now();
-					}
-				}
-				"C" => {
-					let hc = metadata_utils::parse_chunk_metadata(&buf)?;
-					match &mut file_data {
-						Some(data) => {
-							data.chunks.push(hc.clone());
+						// Send progress update every 100 files or every 200ms
+						if files_count % 100 == 0 || last_update.elapsed().as_millis() >= 200 {
+							progress_callback(files_count, bytes_count);
+							last_update = std::time::Instant::now();
 						}
-						None => {
-							return Err("Protocol error: chunk without file".into());
+					} else {
+						// This is a chunk reference for the current file
+						if let Some(ref file_path) = current_file {
+							if let Some(file_data) = self.dir.get_mut(file_path) {
+								for chunk_info in &entry.chunks {
+									file_data.chunks.push(crate::types::HashChunk {
+										hash: chunk_info.hash,
+										offset: chunk_info.offset,
+										size: chunk_info.size,
+									});
+									self.chunks.insert(chunk_info.hash);
+								}
+							}
 						}
 					}
-					self.chunks.insert(hc.hash);
 				}
-				"L" => {
-					let fd = metadata_utils::parse_symlink_metadata(&buf)?;
-					let path = fd.path.clone();
+				FileSystemEntryType::Directory => {
+					let fd = Box::new(FileData {
+						path: entry.path.clone(),
+						tp: FileType::Dir,
+						mode: entry.mode,
+						user: entry.user_id,
+						group: entry.group_id,
+						ctime: entry.created_time,
+						mtime: entry.modified_time,
+						size: 0,
+						chunks: Vec::new(),
+						target: None,
+					});
+
 					files_count += 1;
-					self.dir.insert(fd.path.clone(), fd);
-					file_data = self.dir.get_mut(&path);
+					self.dir.insert(entry.path.clone(), fd);
+					current_file = None;
 
 					// Send progress update every 100 files or every 200ms
 					if files_count % 100 == 0 || last_update.elapsed().as_millis() >= 200 {
@@ -204,12 +158,23 @@ impl NodeState {
 						last_update = std::time::Instant::now();
 					}
 				}
-				"D" => {
-					let fd = metadata_utils::parse_dir_metadata(&buf)?;
-					let path = fd.path.clone();
+				FileSystemEntryType::SymLink => {
+					let fd = Box::new(FileData {
+						path: entry.path.clone(),
+						tp: FileType::SymLink,
+						mode: entry.mode,
+						user: entry.user_id,
+						group: entry.group_id,
+						ctime: entry.created_time,
+						mtime: entry.modified_time,
+						size: 0,
+						chunks: Vec::new(),
+						target: entry.target,
+					});
+
 					files_count += 1;
-					self.dir.insert(fd.path.clone(), fd);
-					file_data = self.dir.get_mut(&path);
+					self.dir.insert(entry.path.clone(), fd);
+					current_file = None;
 
 					// Send progress update every 100 files or every 200ms
 					if files_count % 100 == 0 || last_update.elapsed().as_millis() >= 200 {
@@ -217,7 +182,6 @@ impl NodeState {
 						last_update = std::time::Instant::now();
 					}
 				}
-				_ => return Err(format!("Unknown command in protocol: {}", cmd).into()),
 			}
 		}
 

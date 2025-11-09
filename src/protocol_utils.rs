@@ -19,6 +19,7 @@ use std::error::Error;
 /// let fields = parse_protocol_line("FILE:path:hash:size", 3)?;
 /// assert_eq!(fields, vec!["FILE", "path", "hash", "size"]);
 /// ```
+#[allow(dead_code)]
 pub fn parse_protocol_line(buf: &str, expected_fields: usize) -> Result<Vec<&str>, Box<dyn Error>> {
 	let fields: Vec<&str> = buf.trim().split(':').collect();
 	if fields.len() < expected_fields {

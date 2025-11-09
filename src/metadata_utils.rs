@@ -7,6 +7,7 @@ use crate::types::{FileData, FileType, HashChunk};
 /// Parse file metadata from F: protocol line
 /// Format: F:path:mode:user:group:ctime:mtime:size
 /// Returns: FileData with FileType::File
+#[allow(dead_code)]
 pub fn parse_file_metadata(buf: &str) -> Result<Box<FileData>, Box<dyn Error>> {
 	let fields = protocol_utils::parse_protocol_line(buf, 8)?;
 	let path = path::PathBuf::from(fields[1]);
@@ -30,6 +31,7 @@ pub fn parse_file_metadata(buf: &str) -> Result<Box<FileData>, Box<dyn Error>> {
 /// Parse directory metadata from D: protocol line
 /// Format: D:path:mode:user:group:ctime:mtime
 /// Returns: FileData with FileType::Dir and size=0
+#[allow(dead_code)]
 pub fn parse_dir_metadata(buf: &str) -> Result<Box<FileData>, Box<dyn Error>> {
 	let fields = protocol_utils::parse_protocol_line(buf, 7)?;
 	let path = path::PathBuf::from(fields[1]);
@@ -53,6 +55,7 @@ pub fn parse_dir_metadata(buf: &str) -> Result<Box<FileData>, Box<dyn Error>> {
 /// Parse symlink metadata from L: protocol line
 /// Format: L:path:mode:user:group:ctime:mtime:target
 /// Returns: FileData with FileType::SymLink and size=0
+#[allow(dead_code)]
 pub fn parse_symlink_metadata(buf: &str) -> Result<Box<FileData>, Box<dyn Error>> {
 	let fields = protocol_utils::parse_protocol_line(buf, 8)?;
 	let path = path::PathBuf::from(fields[1]);
@@ -77,6 +80,7 @@ pub fn parse_symlink_metadata(buf: &str) -> Result<Box<FileData>, Box<dyn Error>
 /// Parse chunk metadata from C: protocol line
 /// Format: C:offset:size:hash (hash is base64-encoded BLAKE3)
 /// Returns: HashChunk for this chunk
+#[allow(dead_code)]
 pub fn parse_chunk_metadata(buf: &str) -> Result<HashChunk, Box<dyn Error>> {
 	let fields = protocol_utils::parse_protocol_line(buf, 4)?;
 

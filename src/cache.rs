@@ -8,7 +8,9 @@ use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::path;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use sysinfo::{Pid, ProcessesToUpdate};
 
 use crate::types::HashChunk;
 
@@ -75,105 +77,73 @@ const FILES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("files");
 /// Table definition for active sync locks
 /// Key: path being synced (String)
 /// Value: serialized LockInfo (bytes)
-const ACTIVE_SYNCS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("active_syncs");
+pub const ACTIVE_SYNCS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("active_syncs");
 
 /// Check if a process with given PID is currently alive
-#[cfg(target_os = "linux")]
+/// Uses sysinfo crate for cross-platform process detection
 fn is_process_alive(pid: u32) -> bool {
-	// On Linux, check if /proc/{pid} directory exists
-	// This is a safe alternative to the kill syscall
-	let proc_path_str = format!("/proc/{}", pid);
-	std::path::Path::new(&proc_path_str).exists()
-}
+	// Convert u32 PID to sysinfo Pid
+	let pid = Pid::from_u32(pid);
 
-#[cfg(target_os = "macos")]
-fn is_process_alive(pid: u32) -> bool {
-	// On macOS, check if /proc/{pid} exists (macOS 13.0+) or fallback to conservative approach
-	let proc_path_str = format!("/proc/{}", pid);
-	if std::path::Path::new(&proc_path_str).exists() {
-		return true;
-	}
-	// Fallback: assume alive if we can't determine (conservative approach)
-	// Could be improved with sysctl or other macOS-specific APIs
-	true
-}
+	// Check if process exists using sysinfo
+	// This works on Linux, macOS, Windows, and other supported platforms
+	let mut sys = sysinfo::System::new();
+	sys.refresh_processes(ProcessesToUpdate::All, false);
 
-#[cfg(target_os = "windows")]
-fn is_process_alive(_pid: u32) -> bool {
-	// On Windows, assume process is alive (conservative approach)
-	// Could be improved with Windows API calls if needed
-	true
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-fn is_process_alive(_pid: u32) -> bool {
-	// On other Unix-like systems, assume process is alive (conservative approach)
-	true
-}
-
-/// Check if an error indicates the database is already open
-fn is_database_already_open_error(error: &redb::DatabaseError) -> bool {
-	// Check if this is a DatabaseAlreadyOpen error by examining the error message
-	// redb returns this when attempting to open an already-open database
-	let error_msg = error.to_string();
-	error_msg.contains("DatabaseAlreadyOpen") || error_msg.contains("already open")
+	// Check if the process exists
+	sys.process(pid).is_some()
 }
 
 /// Guard that releases path locks when dropped
+///
+/// Holds a reference to the database to ensure it remains open during the guard's lifetime.
+/// When the guard is dropped, it automatically releases all acquired locks via a write transaction.
+/// The Arc's reference counting ensures the database is only closed when all references are gone.
 #[derive(Debug)]
 pub struct PathLockGuard {
-	db_path: path::PathBuf,
+	db: Arc<redb::Database>,
 	paths: Vec<String>,
 }
 
 impl PathLockGuard {
-	/// Manual release of locks (called on drop or explicitly)
-	fn release(&mut self) -> Result<(), Box<dyn Error>> {
-		if !self.paths.is_empty() {
-			// Try to open the database to release locks
-			// If the database is already open by the original ChildCache instance,
-			// that's expected and safe - locks will be released when ChildCache drops.
-			// Stale lock detection will clean up any remaining locks if needed.
-			match redb::Database::open(&self.db_path) {
-				Ok(db) => {
-					let write_txn = db.begin_write()?;
-					{
-						let mut table = write_txn.open_table(ACTIVE_SYNCS_TABLE)?;
-						for path in &self.paths {
-							let _ = table.remove(path.as_str());
-						}
-					}
-					write_txn.commit()?;
-					self.paths.clear();
-				}
-				Err(e) if is_database_already_open_error(&e) => {
-					// Database is still open (original ChildCache instance active)
-					// Locks will be released when the original ChildCache is dropped
-					// This is safe - stale lock detection will clean up if needed
-				}
-				Err(e) => return Err(e.into()),
+	/// Release locks for all paths held by this guard
+	fn release_locks(&self) -> Result<(), Box<dyn Error>> {
+		if self.paths.is_empty() {
+			return Ok(());
+		}
+
+		let write_txn = self.db.begin_write()?;
+		{
+			let mut table = write_txn.open_table(ACTIVE_SYNCS_TABLE)?;
+			for path in &self.paths {
+				let _ = table.remove(path.as_str());
 			}
 		}
+		write_txn.commit()?;
 		Ok(())
 	}
 }
 
 impl Drop for PathLockGuard {
 	fn drop(&mut self) {
-		let _ = self.release();
+		// Release locks when guard is dropped
+		// Errors are logged but not propagated (Drop can't return Result)
+		if let Err(e) = self.release_locks() {
+			eprintln!("Warning: failed to release locks: {}", e);
+		}
 	}
 }
 
 /// Child cache backed by redb database
 pub struct ChildCache {
-	pub(crate) db: redb::Database,
-	db_path: path::PathBuf,
+	pub(crate) db: Arc<redb::Database>,
 }
 
 impl ChildCache {
 	/// Open or create a child cache database
 	pub fn open(db_path: &path::Path) -> Result<Self, Box<dyn Error>> {
 		let db = redb::Database::create(db_path)?;
+		let db = Arc::new(db);
 		// Ensure both tables exist
 		{
 			let write_txn = db.begin_write()?;
@@ -181,7 +151,7 @@ impl ChildCache {
 			let _ = write_txn.open_table(ACTIVE_SYNCS_TABLE)?;
 			write_txn.commit()?;
 		}
-		Ok(ChildCache { db, db_path: db_path.to_path_buf() })
+		Ok(ChildCache { db })
 	}
 
 	/// Check if a file cache entry is valid (exists and mtime matches)
@@ -325,7 +295,7 @@ impl ChildCache {
 		write_txn.commit()?;
 
 		Ok(PathLockGuard {
-			db_path: self.db_path.clone(),
+			db: Arc::clone(&self.db),
 			paths: paths.iter().map(|s| s.to_string()).collect(),
 		})
 	}

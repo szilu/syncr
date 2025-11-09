@@ -1,7 +1,5 @@
-pub mod protocol;
 pub mod state;
 
-pub use self::protocol::{handshake, log_trace_message, parse_trace_message};
 pub use self::state::NodeState;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -9,7 +7,7 @@ use std::error::Error;
 use std::io::{self, Read};
 use std::path;
 use tokio::fs as afs;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
 // Use the old connect module directly (not the new connection.rs library API)
@@ -134,15 +132,10 @@ struct SyncState {
 }
 
 impl SyncState {
-	fn add_node(
-		&mut self,
-		send: tokio::process::ChildStdin,
-		recv: BufReader<tokio::process::ChildStdout>,
-	) {
+	fn add_node(&mut self, protocol: Box<dyn crate::protocol::SyncProtocol>) {
 		let node = NodeState {
 			id: self.nodes.len() as u8 + 1,
-			send: Mutex::new(send),
-			recv: Mutex::new(recv),
+			protocol: Mutex::new(protocol),
 			dir: BTreeMap::new(),
 			chunks: BTreeSet::new(),
 			missing: Mutex::new(BTreeSet::new()),
@@ -462,18 +455,18 @@ async fn run_sync_logic(
 			});
 		}
 
-		let mut conn = connect::connect(dir).await?;
+		let conn = connect::connect(dir).await?;
 
-		// Perform protocol handshake
-		info!("Handshaking with {}...", dir);
-		handshake(&mut conn.send, &mut conn.recv).await?;
+		// Perform protocol negotiation and handshake
+		info!("Negotiating protocol with {}...", dir);
+		let protocol = crate::protocol::negotiate_protocol(conn.send, conn.recv).await?;
 
 		// Notify that node is ready
 		if let Some(ref cb) = callbacks {
 			cb.on_event(SyncCallbackEvent::NodeReady { node_id: idx, location: dir.to_string() });
 		}
 
-		state.add_node(conn.send, conn.recv);
+		state.add_node(protocol);
 	}
 
 	// Notify callbacks that we're collecting
@@ -503,9 +496,10 @@ async fn run_sync_logic(
 		.iter_mut()
 		.enumerate()
 		.map(|(idx, node)| {
+			// Share callback across tasks via Arc (no Mutex needed - trait is Sync)
 			let callback_ref = callbacks.as_ref().map(|cb| {
-				// Clone the Arc to share across tasks
-				std::sync::Arc::new(std::sync::Mutex::new(cb))
+				// Cast to trait object and wrap in Arc for sharing
+				std::sync::Arc::from(cb.as_ref())
 			});
 			let node_id = idx;
 
@@ -514,13 +508,11 @@ async fn run_sync_logic(
 				node.do_collect(|files_count, bytes_count| {
 					// Send incremental progress update
 					if let Some(ref cb_arc) = callback_ref {
-						if let Ok(cb_guard) = cb_arc.lock() {
-							cb_guard.on_event(SyncCallbackEvent::NodeStats {
-								node_id,
-								files_known: files_count,
-								bytes_known: bytes_count,
-							});
-						}
+						cb_arc.on_event(SyncCallbackEvent::NodeStats {
+							node_id,
+							files_known: files_count,
+							bytes_known: bytes_count,
+						});
 					}
 				})
 				.await?;
@@ -541,13 +533,11 @@ async fn run_sync_logic(
 
 				// Send final NodeStats to ensure we have the accurate final count
 				if let Some(ref cb_arc) = callback_ref {
-					if let Ok(cb_guard) = cb_arc.lock() {
-						cb_guard.on_event(SyncCallbackEvent::NodeStats {
-							node_id,
-							files_known: files_collected,
-							bytes_known: bytes_collected,
-						});
-					}
+					cb_arc.on_event(SyncCallbackEvent::NodeStats {
+						node_id,
+						files_known: files_collected,
+						bytes_known: bytes_collected,
+					});
 				}
 
 				Ok::<(), Box<dyn std::error::Error>>(())
@@ -665,11 +655,14 @@ async fn run_sync_logic(
 							if winner.is_none() {
 								winner = SyncOption::Some(idx as u8);
 							} else if let SyncOption::Some(win) = winner {
-								let w = files[win as usize].unwrap();
-								if f.tp != w.tp
-									|| f.mode != w.mode || f.user != w.user
-									|| f.group != w.group || f.chunks != w.chunks
-								{
+								if let Some(Some(w)) = files.get(win as usize) {
+									if f.tp != w.tp
+										|| f.mode != w.mode || f.user != w.user
+										|| f.group != w.group || f.chunks != w.chunks
+									{
+										winner = SyncOption::Conflict;
+									}
+								} else {
 									winner = SyncOption::Conflict;
 								}
 							}
@@ -753,7 +746,7 @@ async fn run_sync_logic(
 								conflicts.push((path.to_path_buf(), cloned_files));
 							}
 							Err(e) => {
-								panic!(
+								error!(
 									"Failed to borrow detected_conflicts for {}: {}",
 									path.display(),
 									e
@@ -786,28 +779,15 @@ async fn run_sync_logic(
 				}
 				if let SyncOption::Some(win) = winner {
 					// Use original_files (not deduped) since winner is a node index
-					let w = original_files[win as usize].unwrap();
-					//state.tree.insert(path.clone(), win);
-					//tree.insert(path.clone(), win);
-					tree.insert(path.clone(), w.clone());
-				}
-				winner
-
-				/*
-				// FIXME: This algorithm always syncs from the latest modification
-				for (idx, file) in files.iter().enumerate() {
-					if let Some(f) = file {
-						if latest.is_none() || f.mtime > files[latest.unwrap() as usize].unwrap().mtime {
-							latest = Some(idx as u8);
-						}
+					if let Some(Some(w)) = original_files.get(win as usize) {
+						//state.tree.insert(path.clone(), win);
+						//tree.insert(path.clone(), win);
+						tree.insert(path.clone(), (*w).clone());
+					} else {
+						warn!("Winner node {} doesn't have file {} or is out of bounds - skipping tree insert", win, path.display());
 					}
 				}
-				files.dedup();
-				if files.len() <= 1 {
-					latest = None;
-				}
-				latest
-				*/
+				winner
 			});
 		}
 	}
@@ -954,15 +934,6 @@ async fn run_sync_logic(
 
 	// Terminal will be automatically restored by TerminalGuard when it goes out of scope
 
-	/*
-	let mut json: String = "".to_owned();
-	for (file, node) in tree {
-		json.push('"');
-		json.push_str(&file.to_str().unwrap());
-		json.push_str("\":");
-		json.push_str(json5::to_string(state.nodes[node as usize].dir.get(&file).unwrap()).unwrap().as_str());
-	}
-	*/
 	let json =
 		json5::to_string(&tree).map_err(|e| format!("Failed to serialize state to JSON: {}", e))?;
 	debug!("JSON: {}", json);
@@ -979,7 +950,12 @@ async fn run_sync_logic(
 		});
 	}
 	for node in &state.nodes {
-		node.send("WRITE").await?;
+		node.protocol
+			.lock()
+			.await
+			.begin_metadata_transfer()
+			.await
+			.map_err(|e| Box::new(e) as Box<dyn Error>)?;
 	}
 
 	// Count total files that need syncing for progress tracking
@@ -1057,7 +1033,13 @@ async fn run_sync_logic(
 		}
 
 		for node in &state.nodes {
-			node.send(&format!("DEL:{}", deleted_path)).await?;
+			let path = std::path::Path::new(deleted_path.as_str());
+			node.protocol
+				.lock()
+				.await
+				.send_delete(path)
+				.await
+				.map_err(|e| Box::new(e) as Box<dyn Error>)?;
 		}
 
 		metrics.files_deleted += 1;
@@ -1089,6 +1071,16 @@ async fn run_sync_logic(
 			bytes_total: 0,
 			transfer_rate: 0.0,
 		}));
+	}
+
+	// Sync missing chunks from protocol to NodeState
+	// (Protocol's missing set was populated during send_metadata calls)
+	for node in &state.nodes {
+		let protocol_missing = node.protocol.lock().await.get_missing_chunks().await;
+		let mut node_missing = node.missing.lock().await;
+		for chunk_hash in protocol_missing {
+			node_missing.insert(chunk_hash);
+		}
 	}
 
 	// Do chunk transfers
@@ -1147,74 +1139,101 @@ async fn run_sync_logic(
 	let mut done: BTreeSet<String> = BTreeSet::new();
 	for (src_idx, srcnode) in state.nodes.iter().enumerate() {
 		debug!("  - NODE {}", srcnode.id);
-		srcnode.send(".\nREAD").await?;
+
+		// Collect all chunks to request from this source
+		let mut chunks_to_request = Vec::new();
 		for (dst_idx, dstnode) in state.nodes.iter().enumerate() {
 			if dst_idx != src_idx {
 				let missing = dstnode.missing.lock().await;
 				for chunk_b64 in missing.iter() {
 					if !done.contains(chunk_b64) {
-						//eprintln!("MISSING CHUNK: {} {:?}", chunk_b64, srcnode.chunks.get(chunk_b64));
 						// Convert base64 hash to binary for chunks lookup
 						if let Ok(chunk_hash) = crate::util::base64_to_hash(chunk_b64) {
 							if srcnode.chunks.contains(&chunk_hash) {
-								srcnode.send(chunk_b64).await?;
-								done.insert(String::from(chunk_b64));
+								chunks_to_request.push(chunk_b64.clone());
+								done.insert(chunk_b64.clone());
 							}
 						}
 					}
 				}
 			}
 		}
-		srcnode.send(".").await?;
-		let mut buf = String::new();
-		let mut chunk = String::new();
-		let mut chunkdata = String::new();
+
+		// Close WRITE session before entering READ mode
+		srcnode
+			.protocol
+			.lock()
+			.await
+			.end_metadata_transfer()
+			.await
+			.map_err(|e| Box::new(e) as Box<dyn Error>)?;
+
+		// Begin chunk transfer and request chunks
+		srcnode
+			.protocol
+			.lock()
+			.await
+			.begin_chunk_transfer()
+			.await
+			.map_err(|e| Box::new(e) as Box<dyn Error>)?;
+		srcnode
+			.protocol
+			.lock()
+			.await
+			.request_chunks(&chunks_to_request)
+			.await
+			.map_err(|e| Box::new(e) as Box<dyn Error>)?;
+
+		// Receive chunks
 		loop {
-			buf.clear();
-			srcnode.recv.lock().await.read_line(&mut buf).await?;
+			let chunk_opt = srcnode
+				.protocol
+				.lock()
+				.await
+				.receive_chunk()
+				.await
+				.map_err(|e| Box::new(e) as Box<dyn Error>)?;
 
-			// Skip trace messages from child
-			if let Some((level, message)) = parse_trace_message(buf.trim()) {
-				log_trace_message(level, &message, srcnode.id);
-				continue;
-			}
+			let Some(chunk) = chunk_opt else {
+				break; // No more chunks
+			};
 
-			if chunk.is_empty() && buf.len() >= 2 && &buf[..2] == "C:" {
-				chunk.clear();
-				chunk.push_str(&buf.trim()[2..]);
-				chunkdata.clear();
-			} else if chunk.is_empty() && buf.trim() == "." {
-				break;
-			} else if buf.trim() == "." {
-				chunkdata.push('.');
-				let data = &["C:", &chunk, "\n", &chunkdata].join("");
+			let hash_str = &chunk.hash;
+			let chunk_data = chunk.data;
+			let chunk_size = chunk_data.len() as u64;
 
-				// Calculate actual bytes in this chunk (base64 decode ratio)
-				// chunkdata includes the terminating ".\n" and base64 content
-				let chunk_size = (chunkdata.len() as f64 * 3.0 / 4.0) as u64;
+			// Send chunk to nodes that need it
+			for (dst_idx, dstnode) in state.nodes.iter().enumerate() {
+				if dst_idx != src_idx {
+					let mut missing = dstnode.missing.lock().await;
+					if missing.contains(hash_str) {
+						dstnode
+							.protocol
+							.lock()
+							.await
+							.send_chunk(hash_str, &chunk_data)
+							.await
+							.map_err(|e| Box::new(e) as Box<dyn Error>)?;
 
-				for (dst_idx, dstnode) in state.nodes.iter().enumerate() {
-					if dst_idx != src_idx {
-						let mut missing = dstnode.missing.lock().await;
-						if missing.get(&chunk).is_some() {
-							// Send chunk
-							dstnode.send(data).await?;
-							missing.remove(&chunk);
-							// Track bytes sent from source to destination node
-							*node_to_node_bytes.entry((src_idx, dst_idx)).or_insert(0) +=
-								chunk_size;
+						missing.remove(hash_str);
+						// Track bytes sent from source to destination node
+						*node_to_node_bytes.entry((src_idx, dst_idx)).or_insert(0) += chunk_size;
 
-							// Update progress for chunk transfer
-							chunks_transferred += 1;
-							bytes_transferred += chunk_size;
+						// Update progress for chunk transfer
+						chunks_transferred += 1;
+						bytes_transferred += chunk_size;
 
-							// Update metrics
-							metrics.chunks_transferred = chunks_transferred;
-							metrics.bytes_transferred = bytes_transferred;
+						// Update metrics
+						metrics.chunks_transferred = chunks_transferred;
+						metrics.bytes_transferred = bytes_transferred;
 
-							let elapsed_secs = chunk_transfer_start.elapsed().as_secs_f64();
-							let transfer_rate = if elapsed_secs > 0.0 {
-								(bytes_transferred as f64 / 1_000_000.0) / elapsed_secs // MB/s
+						// Send progress update (throttled to every 10 chunks or 100ms)
+						if chunks_transferred % 10 == 0
+							|| chunk_transfer_start.elapsed().as_millis() >= 100
+						{
+							let elapsed = chunk_transfer_start.elapsed().as_secs_f64();
+							let transfer_rate = if elapsed > 0.0 {
+								(bytes_transferred as f64 / 1_000_000.0) / elapsed
 							} else {
 								0.0
 							};
@@ -1232,18 +1251,28 @@ async fn run_sync_logic(
 						}
 					}
 				}
-				chunk.clear();
-				chunkdata.clear();
-			} else {
-				chunkdata += &buf;
 			}
 		}
-		srcnode.send("WRITE").await?;
+
+		// READ session auto-closes when server sends END marker
+		// Now re-enter WRITE mode so this source can receive chunks from other sources
+		srcnode
+			.protocol
+			.lock()
+			.await
+			.begin_metadata_transfer()
+			.await
+			.map_err(|e| Box::new(e) as Box<dyn Error>)?;
 	}
 
-	// Close WRITE sessions
+	// Close all WRITE sessions
 	for node in &state.nodes {
-		node.send(".").await?;
+		node.protocol
+			.lock()
+			.await
+			.end_metadata_transfer()
+			.await
+			.map_err(|e| Box::new(e) as Box<dyn Error>)?;
 	}
 
 	// Emit FileOperation events for actual chunk transfers
@@ -1289,43 +1318,30 @@ async fn run_sync_logic(
 		});
 	}
 	let total_nodes = state.nodes.len();
-	let mut nodes_committed = 0;
-	for node in &state.nodes {
-		node.send("COMMIT").await?;
-		// Wait for response and check for errors
-		let mut buf = String::new();
-		loop {
-			buf.clear();
-			node.recv.lock().await.read_line(&mut buf).await?;
+	for (nodes_committed, node) in state.nodes.iter().enumerate() {
+		let commit_response = node
+			.protocol
+			.lock()
+			.await
+			.commit()
+			.await
+			.map_err(|e| Box::new(e) as Box<dyn Error>)?;
 
-			// Skip trace messages from child
-			if let Some((level, message)) = parse_trace_message(buf.trim()) {
-				log_trace_message(level, &message, node.id);
-				continue;
-			}
+		if !commit_response.success {
+			let msg = commit_response.message.unwrap_or_else(|| "Unknown error".to_string());
+			return Err(format!("Node {} failed to commit: {}", node.id, msg).into());
+		}
 
-			let response = buf.trim();
-			if response.starts_with("ERROR:") {
-				return Err(format!("Node {} failed to commit: {}", node.id, response).into());
-			} else if response == "OK" {
-				nodes_committed += 1;
-				// Send progress after each node commits
-				if let Some(ref cb) = callbacks {
-					cb.on_event(SyncCallbackEvent::Progress(ProgressUpdate {
-						phase: SyncPhase::Committing,
-						files_processed: nodes_committed,
-						files_total: total_nodes,
-						bytes_transferred: 0,
-						bytes_total: 0,
-						transfer_rate: 0.0,
-					}));
-				}
-				break;
-			} else {
-				return Err(
-					format!("Node {} returned unexpected response: {}", node.id, response).into()
-				);
-			}
+		// Send progress after each node commits
+		if let Some(ref cb) = callbacks {
+			cb.on_event(SyncCallbackEvent::Progress(ProgressUpdate {
+				phase: SyncPhase::Committing,
+				files_processed: nodes_committed + 1,
+				files_total: total_nodes,
+				bytes_transferred: 0,
+				bytes_total: 0,
+				transfer_rate: 0.0,
+			}));
 		}
 	}
 
@@ -1337,41 +1353,11 @@ async fn run_sync_logic(
 async fn cleanup_nodes(state: &SyncState) {
 	info!("Shutting down child processes...");
 	for node in &state.nodes {
-		// First, try to exit any active WRITE sessions by sending "."
-		// If node is in WRITE mode, "." exits it; if not in WRITE mode, it's ignored
-		let _ = node.send(".").await;
-
-		// Send QUIT command
-		if let Err(e) = node.send("QUIT").await {
-			warn!("Failed to send QUIT to node {}: {}", node.id, e);
-			continue;
-		}
-
-		// Wait for acknowledgment (.) or EOF
-		let mut buf = String::new();
-		loop {
-			buf.clear();
-			match node.recv.lock().await.read_line(&mut buf).await {
-				Ok(0) => {
-					// EOF - child closed connection
-					debug!("Node {} closed connection", node.id);
-					break;
-				}
-				Ok(_) => {
-					if buf.trim() == "." {
-						debug!("Node {} acknowledged QUIT", node.id);
-						break;
-					}
-					// Skip any remaining trace messages from child
-					if let Some((level, message)) = parse_trace_message(buf.trim()) {
-						log_trace_message(level, &message, node.id);
-					}
-				}
-				Err(e) => {
-					warn!("Error reading from node {} during shutdown: {}", node.id, e);
-					break;
-				}
-			}
+		// Close the protocol connection (sends QUIT)
+		if let Err(e) = node.protocol.lock().await.close().await {
+			warn!("Failed to close connection to node {}: {}", node.id, e);
+		} else {
+			debug!("Node {} connection closed", node.id);
 		}
 	}
 	info!("All child processes shut down");

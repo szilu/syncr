@@ -189,8 +189,7 @@ pub async fn handle_key(
 
 /// Move to the next conflict in the queue
 fn move_to_next_conflict(state: &mut AppState) {
-	if !state.sync.conflicts.is_empty() {
-		let (path, description) = state.sync.conflicts.pop_front().unwrap();
+	if let Some((path, description)) = state.sync.conflicts.pop_front() {
 		state.sync.current_conflict = Some((path, description));
 	} else {
 		// No more conflicts - return to sync view

@@ -1,5 +1,6 @@
 use base64::{engine::general_purpose, Engine as _};
 use rollsum::Bup;
+use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -18,8 +19,114 @@ use crate::protocol_utils;
 use crate::types::{FileChunk, HashChunk};
 use crate::util;
 
-/// Protocol version for handshake and compatibility checking
-const PROTOCOL_VERSION: u8 = 1;
+// V3 Protocol message structures
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct VersionCommand {
+	cmd: String,
+	ver: i32,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	log: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct VersionResponse {
+	cmd: String,
+	ver: i32,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct ErrorResponse {
+	cmd: String,
+	msg: String,
+}
+
+// V3 Protocol data structures for file/directory listing and transfer
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct FileEntity {
+	#[serde(rename = "typ")]
+	entity_type: String, // "F"
+	#[serde(rename = "pth")]
+	path: String,
+	#[serde(rename = "mod", skip_serializing_if = "Option::is_none")]
+	mode: Option<u32>,
+	#[serde(rename = "uid", skip_serializing_if = "Option::is_none")]
+	user_id: Option<u32>,
+	#[serde(rename = "gid", skip_serializing_if = "Option::is_none")]
+	group_id: Option<u32>,
+	#[serde(rename = "ct", skip_serializing_if = "Option::is_none")]
+	created_time: Option<u64>,
+	#[serde(rename = "mt", skip_serializing_if = "Option::is_none")]
+	modified_time: Option<u64>,
+	#[serde(rename = "sz", skip_serializing_if = "Option::is_none")]
+	size: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct DirectoryEntity {
+	#[serde(rename = "typ")]
+	entity_type: String, // "D"
+	#[serde(rename = "pth")]
+	path: String,
+	#[serde(rename = "mod", skip_serializing_if = "Option::is_none")]
+	mode: Option<u32>,
+	#[serde(rename = "uid", skip_serializing_if = "Option::is_none")]
+	user_id: Option<u32>,
+	#[serde(rename = "gid", skip_serializing_if = "Option::is_none")]
+	group_id: Option<u32>,
+	#[serde(rename = "ct", skip_serializing_if = "Option::is_none")]
+	created_time: Option<u64>,
+	#[serde(rename = "mt", skip_serializing_if = "Option::is_none")]
+	modified_time: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct SymlinkEntity {
+	#[serde(rename = "typ")]
+	entity_type: String, // "S"
+	#[serde(rename = "pth")]
+	path: String,
+	#[serde(rename = "mod", skip_serializing_if = "Option::is_none")]
+	mode: Option<u32>,
+	#[serde(rename = "uid", skip_serializing_if = "Option::is_none")]
+	user_id: Option<u32>,
+	#[serde(rename = "gid", skip_serializing_if = "Option::is_none")]
+	group_id: Option<u32>,
+	#[serde(rename = "ct", skip_serializing_if = "Option::is_none")]
+	created_time: Option<u64>,
+	#[serde(rename = "mt", skip_serializing_if = "Option::is_none")]
+	modified_time: Option<u64>,
+	#[serde(rename = "tgt", skip_serializing_if = "Option::is_none")]
+	target: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct ChunkEntity {
+	#[serde(rename = "typ")]
+	entity_type: String, // "C"
+	#[serde(rename = "off")]
+	offset: u64,
+	#[serde(rename = "len")]
+	length: u32,
+	#[serde(rename = "hsh")]
+	hash: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct ChunkHeader {
+	cmd: String,
+	#[serde(rename = "hsh")]
+	hash: String,
+	#[serde(rename = "len")]
+	length: u32,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct EndCommand {
+	cmd: String,
+}
+
+/// Protocol version for handshake and compatibility checking (V3 only)
+const PROTOCOL_VERSION_V3: i32 = 3;
 
 // Type alias for complex async function return type
 type BoxedAsyncResult<'a> =
@@ -103,6 +210,7 @@ fn validate_path(path: &path::Path) -> Result<(), Box<dyn Error>> {
 pub struct DumpState {
 	pub exclude: Vec<glob::Pattern>,
 	pub chunks: BTreeMap<String, Vec<FileChunk>>,
+	#[allow(dead_code)]
 	pub missing: RefCell<BTreeMap<String, Vec<FileChunk>>>,
 	pub rename: RefCell<BTreeMap<path::PathBuf, path::PathBuf>>,
 	pub cache: Option<ChildCache>,
@@ -382,12 +490,595 @@ fn traverse_dir<'a>(state: &'a mut DumpState, dir: path::PathBuf) -> BoxedAsyncR
 					meta.ctime(),
 					meta.mtime()
 				);
-				//protocol_println!("D:{}:{}:{}", path.to_str().unwrap(), meta.uid(), meta.gid());
+				// Note: The above now includes UID/GID/ctime - old 3-field format removed
 				traverse_dir(state, path).await?
 			}
 		}
 		Ok(())
 	})
+}
+
+//////////////
+// V3 Handlers //
+//////////////
+
+/// Traverse directory and output as v3 JSON5 format
+fn traverse_dir_v3<'a>(state: &'a mut DumpState, dir: path::PathBuf) -> BoxedAsyncResult<'a> {
+	Box::pin(async move {
+		let entries = match fs::read_dir(&dir) {
+			Ok(e) => e,
+			Err(e) => {
+				warn!("Cannot read directory {}: {}", dir.display(), e);
+				return Ok(());
+			}
+		};
+
+		for entry_result in entries {
+			let entry = match entry_result {
+				Ok(e) => e,
+				Err(e) => {
+					debug!("Error reading directory entry: {}", e);
+					continue;
+				}
+			};
+			let path = entry.path();
+			if state.exclude[0].matches_path(&path) {
+				continue;
+			}
+
+			let meta = match fs::symlink_metadata(&path) {
+				Ok(m) => m,
+				Err(e) => {
+					warn!("Cannot access {}: {}", path.display(), e);
+					continue;
+				}
+			};
+
+			if meta.is_file() {
+				// Output file entity as JSON5
+				let file_entity = FileEntity {
+					entity_type: "F".to_string(),
+					path: path.to_string_lossy().to_string(),
+					mode: Some(meta.mode()),
+					user_id: Some(meta.uid()),
+					group_id: Some(meta.gid()),
+					created_time: Some(meta.ctime() as u64),
+					modified_time: Some(meta.mtime() as u64),
+					size: Some(meta.size()),
+				};
+				if let Ok(json_str) = serde_json::to_string(&file_entity) {
+					protocol_println!("{}", json_str);
+				}
+
+				// Check cache first
+				let rel_path = path.to_string_lossy().to_string();
+				let mtime = meta.mtime() as u32;
+
+				if let Some(ref cache) = state.cache {
+					match cache.get_chunks(&rel_path, mtime) {
+						Ok(Some(cached_chunks)) => {
+							// Cache hit - use cached chunks without reading file
+							info!("Cache hit: {}", rel_path);
+							for chunk in &cached_chunks {
+								let hash_b64 = util::hash_to_base64(&chunk.hash);
+								let chunk_entity = ChunkEntity {
+									entity_type: "C".to_string(),
+									offset: chunk.offset,
+									length: chunk.size,
+									hash: hash_b64.clone(),
+								};
+								if let Ok(json_str) = serde_json::to_string(&chunk_entity) {
+									protocol_println!("{}", json_str);
+								}
+								state.add_chunk(
+									hash_b64,
+									path.clone(),
+									chunk.offset,
+									chunk.size as usize,
+								);
+							}
+							continue;
+						}
+						Ok(None) => {
+							// Cache miss - need to hash file
+							info!("Cache miss: {}", rel_path);
+						}
+						Err(e) => {
+							warn!("Cache lookup error for {}: {}", rel_path, e);
+						}
+					}
+				}
+
+				// Cache miss or no cache - hash the file
+				let mut chunks_for_cache = Vec::new();
+
+				let mut f = match afs::File::open(&path).await {
+					Ok(file) => file,
+					Err(e) => {
+						warn!("Cannot open file {}: {}", path.display(), e);
+						continue;
+					}
+				};
+
+				let mut buf: Vec<u8> = vec![0; config::MAX_CHUNK_SIZE];
+
+				let mut n = match f.read(&mut buf).await {
+					Ok(bytes) => bytes,
+					Err(e) => {
+						warn!("Cannot read file {}: {}", path.display(), e);
+						continue;
+					}
+				};
+
+				let mut offset: u64 = 0;
+				while n > 0 {
+					let mut bup = Bup::new_with_chunk_bits(config::CHUNK_BITS);
+					let mut endofs = config::MAX_CHUNK_SIZE;
+					if endofs > n {
+						endofs = n
+					}
+					if let Some((count, _hash)) = bup.find_chunk_edge(&buf[..endofs]) {
+						let h = util::hash(&buf[..count]);
+						let hash_binary = util::hash_binary(&buf[..count]);
+
+						// Output chunk entity as JSON5
+						let chunk_entity = ChunkEntity {
+							entity_type: "C".to_string(),
+							offset,
+							length: count as u32,
+							hash: h.clone(),
+						};
+						if let Ok(json_str) = serde_json::to_string(&chunk_entity) {
+							protocol_println!("{}", json_str);
+						}
+
+						state.add_chunk(h, path.clone(), offset, count);
+						chunks_for_cache.push(HashChunk {
+							hash: hash_binary,
+							offset,
+							size: count as u32,
+						});
+
+						buf.copy_within(count..n, 0);
+						offset += count as u64;
+						n -= count;
+					} else {
+						let count = endofs;
+						let h = util::hash(&buf[..count]);
+						let hash_binary = util::hash_binary(&buf[..count]);
+
+						// Output chunk entity as JSON5
+						let chunk_entity = ChunkEntity {
+							entity_type: "C".to_string(),
+							offset,
+							length: count as u32,
+							hash: h.clone(),
+						};
+						if let Ok(json_str) = serde_json::to_string(&chunk_entity) {
+							protocol_println!("{}", json_str);
+						}
+
+						state.add_chunk(h, path.clone(), offset, count);
+						chunks_for_cache.push(HashChunk {
+							hash: hash_binary,
+							offset,
+							size: count as u32,
+						});
+
+						offset += count as u64;
+						n -= count;
+					}
+
+					let read_result = f.read(&mut buf[n..]).await;
+					match read_result {
+						Ok(bytes) => n += bytes,
+						Err(e) => {
+							warn!("Error reading file {}: {}", path.display(), e);
+							break;
+						}
+					}
+				}
+			} else if meta.is_symlink() {
+				// Output symlink entity as JSON5
+				let target = match fs::read_link(&path) {
+					Ok(t) => Some(t.to_string_lossy().to_string()),
+					Err(e) => {
+						warn!("Cannot read symlink {}: {}", path.display(), e);
+						None
+					}
+				};
+
+				let symlink_entity = SymlinkEntity {
+					entity_type: "S".to_string(),
+					path: path.to_string_lossy().to_string(),
+					mode: Some(meta.mode()),
+					user_id: Some(meta.uid()),
+					group_id: Some(meta.gid()),
+					created_time: Some(meta.ctime() as u64),
+					modified_time: Some(meta.mtime() as u64),
+					target,
+				};
+				if let Ok(json_str) = serde_json::to_string(&symlink_entity) {
+					protocol_println!("{}", json_str);
+				}
+			} else if meta.is_dir() {
+				// Output directory entity as JSON5
+				let dir_entity = DirectoryEntity {
+					entity_type: "D".to_string(),
+					path: path.to_string_lossy().to_string(),
+					mode: Some(meta.mode()),
+					user_id: Some(meta.uid()),
+					group_id: Some(meta.gid()),
+					created_time: Some(meta.ctime() as u64),
+					modified_time: Some(meta.mtime() as u64),
+				};
+				if let Ok(json_str) = serde_json::to_string(&dir_entity) {
+					protocol_println!("{}", json_str);
+				}
+
+				// Recursively process subdirectory
+				Box::pin(traverse_dir_v3(state, path)).await?;
+			}
+		}
+		Ok(())
+	})
+}
+
+/// Serve LIST command for v3 protocol (outputs JSON5 format)
+async fn serve_list_v3(dir: path::PathBuf) -> Result<DumpState, Box<dyn Error>> {
+	// Initialize global cache
+	let cache = {
+		let cache_dir = path::PathBuf::from(env::var("HOME").unwrap_or_else(|_| ".".to_string()))
+			.join(".syncr/cache");
+		let _ = fs::create_dir_all(&cache_dir);
+
+		let cache_db_path = cache_dir.join("cache.db");
+
+		match ChildCache::open(&cache_db_path) {
+			Ok(c) => {
+				info!("Cache opened: {}", cache_db_path.display());
+				Some(c)
+			}
+			Err(e) => {
+				info!("Cache unavailable (continuing without): {}", e);
+				if let Err(remove_err) = fs::remove_file(&cache_db_path) {
+					debug!("Could not remove old cache: {}", remove_err);
+				}
+				match ChildCache::open(&cache_db_path) {
+					Ok(c) => {
+						info!("Cache recovered by recreating database");
+						Some(c)
+					}
+					Err(_) => None,
+				}
+			}
+		}
+	};
+
+	let mut state = DumpState {
+		exclude: vec![glob::Pattern::new("**/*.SyNcR-TmP")?],
+		chunks: BTreeMap::new(),
+		missing: RefCell::new(BTreeMap::new()),
+		rename: RefCell::new(BTreeMap::new()),
+		cache,
+	};
+	traverse_dir_v3(&mut state, dir).await?;
+
+	// Send END marker (V3 protocol)
+	let end_cmd = EndCommand { cmd: "END".to_string() };
+	if let Ok(json_str) = serde_json::to_string(&end_cmd) {
+		protocol_println!("{}", json_str);
+	}
+
+	// Send "." terminator (expected by parent's do_collect() for protocol compatibility)
+	protocol_println!(".");
+
+	Ok(state)
+}
+
+/// Serve READ command for v3 protocol (binary chunk transfer)
+async fn serve_read_v3(dir: path::PathBuf, dump_state: &DumpState) -> Result<(), Box<dyn Error>> {
+	let mut chunks: Vec<String> = Vec::new();
+	let mut buf = String::new();
+
+	// Read hash list from parent (ends with "END")
+	loop {
+		buf.clear();
+		io::stdin()
+			.read_line(&mut buf)
+			.map_err(|e| format!("Failed to read chunk request: {}", e))?;
+
+		let trimmed = buf.trim();
+
+		// Try parsing as JSON5 to extract hash
+		if let Ok(json_obj) = json5::from_str::<serde_json::Value>(trimmed) {
+			if let Some(cmd) = json_obj.get("cmd").and_then(|v| v.as_str()) {
+				if cmd == "END" {
+					break;
+				}
+			}
+			if let Some(hsh) = json_obj.get("hsh").and_then(|v| v.as_str()) {
+				chunks.push(hsh.to_string());
+			}
+		}
+	}
+
+	// Send each chunk as binary data
+	for hash in &chunks {
+		if let Ok(Some(chunk_data)) = dump_state.read_chunk(&dir, hash).await {
+			// Send CHK header with hash and length
+			let header = ChunkHeader {
+				cmd: "CHK".to_string(),
+				hash: hash.clone(),
+				length: chunk_data.len() as u32,
+			};
+			if let Ok(json_str) = serde_json::to_string(&header) {
+				protocol_println!("{}", json_str);
+			}
+
+			// Send binary data
+			write_stdout(&chunk_data)?;
+			write_stdout(b"\n")?;
+		} else {
+			// Chunk not found - send error
+			let error =
+				ErrorResponse { cmd: "ERR".to_string(), msg: format!("Chunk not found: {}", hash) };
+			if let Ok(json_str) = serde_json::to_string(&error) {
+				protocol_println!("{}", json_str);
+			}
+		}
+	}
+
+	// Send END marker to signal completion of READ
+	let end_cmd = EndCommand { cmd: "END".to_string() };
+	if let Ok(json_str) = serde_json::to_string(&end_cmd) {
+		protocol_println!("{}", json_str);
+	}
+
+	Ok(())
+}
+
+/// Serve WRITE command for v3 protocol (receives metadata and binary chunks)
+async fn serve_write_v3(_dir: path::PathBuf, dump_state: &DumpState) -> Result<(), Box<dyn Error>> {
+	use std::io::Read;
+
+	let mut buf = String::new();
+	let mut _file: Option<afs::File> = None;
+	let mut filepath = path::PathBuf::from("");
+	// Track chunk metadata: (hash, offset, length, target_file_path)
+	let mut expected_chunks: Vec<(String, u64, u32, path::PathBuf)> = Vec::new();
+	let mut current_chunk_data: Vec<u8> = Vec::new();
+	let mut _current_chunk_hash: String = String::new();
+
+	let mut stdin = io::stdin();
+
+	loop {
+		buf.clear();
+		stdin.read_line(&mut buf)?;
+
+		let trimmed = buf.trim();
+
+		// Try parsing as JSON5
+		if let Ok(json_obj) = json5::from_str::<serde_json::Value>(trimmed) {
+			if let Some(cmd) = json_obj.get("cmd").and_then(|v| v.as_str()) {
+				match cmd {
+					"END" => break, // End of WRITE command
+					"CHK" => {
+						// Chunk header with binary data coming
+						if let (Some(hsh), Some(len)) = (
+							json_obj.get("hsh").and_then(|v| v.as_str()),
+							json_obj.get("len").and_then(|v| v.as_u64()),
+						) {
+							// Read binary chunk data from stdin
+							current_chunk_data.clear();
+							current_chunk_data.resize(len as usize, 0);
+							stdin
+								.read_exact(&mut current_chunk_data)
+								.map_err(|e| format!("Failed to read chunk data: {}", e))?;
+
+							// Consume the newline after binary data
+							let mut newline_buf = [0u8; 1];
+							stdin.read_exact(&mut newline_buf).ok();
+
+							_current_chunk_hash = hsh.to_string();
+
+							// Write chunk to target files based on expected_chunks metadata
+							let hash_binary = crate::util::base64_to_hash(hsh)
+								.map_err(|e| format!("Invalid hash: {}", e))?;
+
+							// Find all chunks with this hash and write to their target files
+							for (chunk_hash, chunk_offset, chunk_len, target_file) in
+								&expected_chunks
+							{
+								if chunk_hash == hsh {
+									let hc = HashChunk {
+										hash: hash_binary,
+										offset: *chunk_offset,
+										size: *chunk_len,
+									};
+									if let Err(e) = dump_state
+										.write_chunk(target_file, &hc, &current_chunk_data)
+										.await
+									{
+										protocol_println!("{{\"cmd\":\"ERR\",\"msg\":\"Failed to write chunk to {}: {}\"}}", target_file.display(), e);
+									}
+								}
+							}
+						}
+					}
+					_ => {}
+				}
+			}
+
+			// Check for file/directory entity (type field)
+			if let Some(typ) = json_obj.get("typ").and_then(|v| v.as_str()) {
+				match typ {
+					"C" => {
+						// Chunk metadata entity - record it for later when chunk data arrives
+						if let (Some(hsh), Some(off), Some(len)) = (
+							json_obj.get("hsh").and_then(|v| v.as_str()),
+							json_obj.get("off").and_then(|v| v.as_u64()),
+							json_obj.get("len").and_then(|v| v.as_u64()),
+						) {
+							// Store chunk with the current filepath (the file this chunk belongs to)
+							expected_chunks.push((
+								hsh.to_string(),
+								off,
+								len as u32,
+								filepath.clone(),
+							));
+						}
+					}
+					"F" => {
+						// File entity
+						if let Some(pth) = json_obj.get("pth").and_then(|v| v.as_str()) {
+							filepath = path::PathBuf::from(pth);
+							validate_path(&filepath)?;
+
+							// Create temp file
+							let filename =
+								filepath.file_name().ok_or("Path has no filename")?.to_os_string();
+							let mut tmp_filename = filename;
+							tmp_filename.push(".SyNcR-TmP");
+							filepath.set_file_name(tmp_filename);
+
+							_file = Some(afs::File::create(&filepath).await?);
+
+							// Set permissions if provided
+							if let Some(mod_val) = json_obj.get("mod").and_then(|v| v.as_u64()) {
+								afs::set_permissions(
+									&filepath,
+									std::fs::Permissions::from_mode(mod_val as u32),
+								)
+								.await
+								.ok();
+							}
+
+							// Track for rename during COMMIT
+							dump_state
+								.rename
+								.borrow_mut()
+								.insert(filepath.clone(), path::PathBuf::from(pth));
+						}
+					}
+					"D" => {
+						// Directory entity
+						if let Some(pth) = json_obj.get("pth").and_then(|v| v.as_str()) {
+							let dir_path = path::PathBuf::from(pth);
+							validate_path(&dir_path)?;
+
+							match afs::create_dir(&dir_path).await {
+								Ok(_) => {}
+								Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+								Err(e) => return Err(e.into()),
+							}
+
+							if let Some(mod_val) = json_obj.get("mod").and_then(|v| v.as_u64()) {
+								afs::set_permissions(
+									&dir_path,
+									std::fs::Permissions::from_mode(mod_val as u32),
+								)
+								.await
+								.ok();
+							}
+						}
+					}
+					"S" => {
+						// Symlink entity
+						if let Some(pth) = json_obj.get("pth").and_then(|v| v.as_str()) {
+							let symlink_path = path::PathBuf::from(pth);
+							validate_path(&symlink_path)?;
+
+							if let Some(target) = json_obj.get("tgt").and_then(|v| v.as_str()) {
+								if afs::metadata(&symlink_path).await.is_ok() {
+									afs::remove_file(&symlink_path).await.ok();
+								}
+								afs::symlink(target, &symlink_path).await.ok();
+							}
+						}
+					}
+					_ => {}
+				}
+			}
+		}
+	}
+
+	// Send completion response
+	protocol_println!("{{\"cmd\":\"OK\"}}");
+
+	Ok(())
+}
+
+/// Serve COMMIT command for v3 protocol (rename temp files to final locations)
+async fn serve_commit_v3(
+	_dir: path::PathBuf,
+	dump_state: &DumpState,
+) -> Result<(), Box<dyn Error>> {
+	let renames_data: Vec<_> =
+		dump_state.rename.borrow().iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+	let mut renamed_count = 0;
+	let mut failed_count = 0;
+
+	for (tmp_path, final_path) in renames_data.iter() {
+		match afs::rename(tmp_path, final_path).await {
+			Ok(_) => renamed_count += 1,
+			Err(e) => {
+				error!("Failed to rename {:?} to {:?}: {}", tmp_path, final_path, e);
+				failed_count += 1;
+			}
+		}
+	}
+
+	// Send COMMIT response
+	protocol_println!(
+		"{{\"cmd\":\"OK\",\"renamed\":{},\"failed\":{}}}",
+		renamed_count,
+		failed_count
+	);
+
+	Ok(())
+}
+
+/// Serve CANCEL command for v3 protocol (clean up temporary files and abort operation)
+async fn serve_cancel_v3(
+	_dir: path::PathBuf,
+	dump_state: &DumpState,
+) -> Result<(), Box<dyn Error>> {
+	let tmp_paths: Vec<_> = dump_state.rename.borrow().keys().cloned().collect();
+	let mut cleaned_count = 0;
+	let mut failed_count = 0;
+
+	// Iterate through all temp files that were created but not yet committed
+	for tmp_path in tmp_paths.iter() {
+		// Try to remove the temp file
+		match afs::remove_file(tmp_path).await {
+			Ok(_) => {
+				debug!("Cancelled temp file: {:?}", tmp_path);
+				cleaned_count += 1;
+			}
+			Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+				// File doesn't exist - might have been deleted already
+				debug!("Temp file already missing: {:?}", tmp_path);
+				cleaned_count += 1;
+			}
+			Err(e) => {
+				error!("Failed to remove temp file {:?}: {}", tmp_path, e);
+				failed_count += 1;
+			}
+		}
+	}
+
+	// Clear the rename map to prevent any renames from occurring later
+	dump_state.rename.borrow_mut().clear();
+
+	// Send CANCEL response with cleanup statistics
+	protocol_println!(
+		"{{\"cmd\":\"OK\",\"cleaned\":{},\"failed\":{}}}",
+		cleaned_count,
+		failed_count
+	);
+
+	Ok(())
 }
 
 pub fn serve_list(dir: path::PathBuf) -> Result<DumpState, Box<dyn Error>> {
@@ -436,6 +1127,7 @@ pub fn serve_list(dir: path::PathBuf) -> Result<DumpState, Box<dyn Error>> {
 	Ok(state)
 }
 
+#[allow(dead_code)]
 async fn serve_read(dir: path::PathBuf, dump_state: &DumpState) -> Result<(), Box<dyn Error>> {
 	let mut chunks: Vec<String> = Vec::new();
 	let mut buf = String::new();
@@ -473,6 +1165,7 @@ async fn serve_read(dir: path::PathBuf, dump_state: &DumpState) -> Result<(), Bo
 	Ok(())
 }
 
+#[allow(dead_code)]
 async fn serve_write(dir: path::PathBuf, dump_state: &DumpState) -> Result<(), Box<dyn Error>> {
 	let mut buf = String::new();
 
@@ -650,6 +1343,7 @@ async fn serve_write(dir: path::PathBuf, dump_state: &DumpState) -> Result<(), B
 	Ok(())
 }
 
+#[allow(dead_code)]
 async fn serve_commit(
 	_fixme_dir: path::PathBuf,
 	dump_state: &DumpState,
@@ -765,6 +1459,10 @@ pub fn serve(dir: &str) -> Result<(), Box<dyn Error>> {
 	writeln!(std::io::stdout(), ".")?;
 	std::io::stdout().flush()?;
 
+	// Perform version negotiation (V3 only)
+	negotiate_version()?;
+	debug!("Negotiated protocol version: V3");
+
 	let mut dump_state: Option<DumpState> = None;
 
 	loop {
@@ -778,71 +1476,154 @@ pub fn serve(dir: &str) -> Result<(), Box<dyn Error>> {
 			}
 		}
 
-		match cmdline.trim() {
-			cmd if cmd.starts_with("VERSION") => {
-				// Handle version handshake
-				let version = if let Some(v) = cmd.strip_prefix("VERSION:") {
-					v.parse::<u8>().unwrap_or(0)
-				} else {
-					0
-				};
-
-				if version == PROTOCOL_VERSION {
-					protocol_println!("VERSION:{}", PROTOCOL_VERSION);
-				} else {
-					error!(
-						"Protocol version mismatch: client={}, server={}",
-						version, PROTOCOL_VERSION
-					);
-					protocol_println!(
-						"ERROR:Protocol version mismatch: expected {}, got {}",
-						PROTOCOL_VERSION,
-						version
-					);
-				}
-			}
-			"LIST" => dump_state = Some(serve_list(path::PathBuf::from("."))?),
-			"READ" => match &dump_state {
-				Some(state) => {
-					tokio::task::block_in_place(|| {
-						tokio::runtime::Handle::current()
-							.block_on(serve_read(path::PathBuf::from("."), state))
-					})?;
-				}
-				None => {
-					protocol_println!("!Use LIST command first!");
-				}
-			},
-			"WRITE" => match &dump_state {
-				Some(state) => {
-					tokio::task::block_in_place(|| {
-						tokio::runtime::Handle::current()
-							.block_on(serve_write(path::PathBuf::from("."), state))
-					})?;
-				}
-				None => {
-					protocol_println!("!Use LIST command first!");
-				}
-			},
-			"COMMIT" => match &dump_state {
-				Some(state) => {
-					tokio::task::block_in_place(|| {
-						tokio::runtime::Handle::current()
-							.block_on(serve_commit(path::PathBuf::from("."), state))
-					})?;
-				}
-				None => {
-					protocol_println!("!Use LIST command first!");
-				}
-			},
-			"QUIT" => break,
-			"." => {
-				// Dot command outside of WRITE mode - ignore it
-				// This is sent by cleanup to ensure we exit any active WRITE sessions
-			}
-			_ => protocol_println!("E:UNK-CMD: Unknown command: {}", &cmdline.trim()),
+		// Handle v3 JSON5 protocol
+		match handle_v3_command(&cmdline, &mut dump_state) {
+			Ok(()) => {}
+			Err(e) if e.to_string() == "QUIT" => break, // Graceful shutdown on QUIT
+			Err(e) => return Err(e),
 		}
 	}
+	Ok(())
+}
+
+/// Negotiate protocol version with parent
+/// Only accepts V3 (JSON5) protocol
+fn negotiate_version() -> Result<i32, Box<dyn Error>> {
+	let mut line = String::new();
+	io::stdin().read_line(&mut line)?;
+
+	let trimmed = line.trim();
+
+	// Try parsing as v3 (JSON5)
+	if let Ok(cmd) = json5::from_str::<VersionCommand>(trimmed) {
+		if cmd.cmd == "VER" && cmd.ver == PROTOCOL_VERSION_V3 {
+			// Respond with v3 format
+			let response = VersionResponse { cmd: "VER".to_string(), ver: PROTOCOL_VERSION_V3 };
+			let response_json = serde_json::to_string(&response)?;
+			protocol_println!("{}", response_json);
+			return Ok(3);
+		}
+	}
+
+	// Unknown format - send v3 error
+	let error = ErrorResponse {
+		cmd: "ERR".to_string(),
+		msg: "Expected {cmd:\"VER\",ver:3} in JSON5 format".to_string(),
+	};
+	let error_json = serde_json::to_string(&error)?;
+	protocol_println!("{}", error_json);
+
+	Err("Unrecognized handshake format".into())
+}
+
+/// Handle v3 (JSON5) protocol commands
+fn handle_v3_command(
+	cmdline: &str,
+	dump_state: &mut Option<DumpState>,
+) -> Result<(), Box<dyn Error>> {
+	let trimmed = cmdline.trim();
+
+	// Skip empty lines
+	if trimmed.is_empty() {
+		return Ok(());
+	}
+
+	// Try parsing as JSON5
+	match json5::from_str::<serde_json::Value>(trimmed) {
+		Ok(json_obj) => {
+			if let Some(cmd) = json_obj.get("cmd").and_then(|v| v.as_str()) {
+				match cmd {
+					"LIST" => {
+						// Serve v3 LIST command (JSON5 format)
+						let new_state = tokio::task::block_in_place(|| {
+							tokio::runtime::Handle::current()
+								.block_on(serve_list_v3(path::PathBuf::from(".")))
+						})?;
+						dump_state.replace(new_state);
+					}
+					"READ" => {
+						// Serve v3 READ command (binary chunk transfer)
+						if let Some(state) = dump_state {
+							tokio::task::block_in_place(|| {
+								tokio::runtime::Handle::current()
+									.block_on(serve_read_v3(path::PathBuf::from("."), state))
+							})?;
+						} else {
+							let error = ErrorResponse {
+								cmd: "ERR".to_string(),
+								msg: "Use LIST command first".to_string(),
+							};
+							if let Ok(json_str) = serde_json::to_string(&error) {
+								protocol_println!("{}", json_str);
+							}
+						}
+					}
+					"WRITE" => {
+						// Serve v3 WRITE command (receive metadata and binary chunks)
+						if let Some(state) = dump_state {
+							tokio::task::block_in_place(|| {
+								tokio::runtime::Handle::current()
+									.block_on(serve_write_v3(path::PathBuf::from("."), state))
+							})?;
+						} else {
+							let error = ErrorResponse {
+								cmd: "ERR".to_string(),
+								msg: "Use LIST command first".to_string(),
+							};
+							if let Ok(json_str) = serde_json::to_string(&error) {
+								protocol_println!("{}", json_str);
+							}
+						}
+					}
+					"COMMIT" => {
+						// Serve v3 COMMIT command (rename temp files to final locations)
+						if let Some(state) = dump_state {
+							tokio::task::block_in_place(|| {
+								tokio::runtime::Handle::current()
+									.block_on(serve_commit_v3(path::PathBuf::from("."), state))
+							})?;
+						} else {
+							let error = ErrorResponse {
+								cmd: "ERR".to_string(),
+								msg: "Use LIST and WRITE commands first".to_string(),
+							};
+							if let Ok(json_str) = serde_json::to_string(&error) {
+								protocol_println!("{}", json_str);
+							}
+						}
+					}
+					"CAN" => {
+						// Serve v3 CANCEL command (clean up temp files and abort operation)
+						if let Some(state) = dump_state {
+							tokio::task::block_in_place(|| {
+								tokio::runtime::Handle::current()
+									.block_on(serve_cancel_v3(path::PathBuf::from("."), state))
+							})?;
+						} else {
+							// CANCEL without active WRITE is not an error - just send OK response
+							protocol_println!("{{\"cmd\":\"OK\",\"cleaned\":0,\"failed\":0}}");
+						}
+					}
+					"QUIT" => {
+						protocol_println!("{{\"cmd\":\"OK\"}}");
+						return Err("QUIT".into());
+					}
+					_ => {
+						protocol_println!(
+							"{{\"cmd\":\"ERR\",\"msg\":\"Unknown command: {}\"}}",
+							cmd
+						);
+					}
+				}
+			}
+		}
+		Err(e) => {
+			// Log JSON5 parse error for debugging, but don't send error response
+			// to avoid confusing the parent with unexpected protocol output
+			debug!("JSON5 parse error: {} (input: {})", e, trimmed);
+		}
+	}
+
 	Ok(())
 }
 

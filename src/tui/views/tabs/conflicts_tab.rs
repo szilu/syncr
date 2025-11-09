@@ -235,6 +235,7 @@ pub fn handle_key(state: &mut AppState, key: KeyEvent) -> Result<(), Box<dyn std
 		}
 		KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
 			// Number keys 1-9 to choose node
+			// Safe unwrap: c.is_ascii_digit() guarantees to_digit(10) returns Some
 			let node_choice = c.to_digit(10).unwrap() as usize - 1;
 			let node_count = state.sync.nodes.len();
 

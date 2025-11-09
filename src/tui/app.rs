@@ -479,10 +479,16 @@ impl TuiApp {
 			// Run sync with callbacks and conflict resolution receiver
 			// Create a dedicated single-threaded runtime for this sync
 			let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-				let rt = tokio::runtime::Builder::new_current_thread()
-					.enable_all()
-					.build()
-					.expect("Failed to create runtime");
+				let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+					Ok(rt) => rt,
+					Err(e) => {
+						eprintln!("Failed to create runtime: {}", e);
+						let _ = event_tx.send(crate::tui::SyncEvent::Failed {
+							error: format!("Failed to create runtime: {}", e),
+						});
+						return Err(format!("Failed to create runtime: {}", e).into());
+					}
+				};
 
 				rt.block_on(async {
 					crate::sync_impl::sync_with_callbacks(
