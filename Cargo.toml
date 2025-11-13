@@ -15,8 +15,11 @@ blake3 = "1.8"
 clap = "4.5"
 futures = "0.3"
 glob = "0.3"
+globset = "0.4"
 hex = "0.4"
+ignore = "0.4"
 json5 = "0.4"
+libc = "0.2"
 redb = "3.1"
 rollsum = "0.3"
 serde = { version = "1.0", features = ["derive"] }
@@ -24,6 +27,7 @@ serde_json = "1.0"
 sysinfo = "0.37"
 termios = "0.3"
 tokio = { version = "1", features = ["full"] }
+toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1.18", features = ["v4", "serde"] }
@@ -34,6 +38,7 @@ crossterm = { version = "0.29", optional = true }
 
 [dev-dependencies]
 tempfile = "3.23"
+filetime = "0.2"
 
 [profile.release]
 opt-level = 3

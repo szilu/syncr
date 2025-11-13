@@ -11,6 +11,7 @@ use std::path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use sysinfo::{Pid, ProcessesToUpdate};
+use tracing::warn;
 
 use crate::types::HashChunk;
 
@@ -129,7 +130,7 @@ impl Drop for PathLockGuard {
 		// Release locks when guard is dropped
 		// Errors are logged but not propagated (Drop can't return Result)
 		if let Err(e) = self.release_locks() {
-			eprintln!("Warning: failed to release locks: {}", e);
+			warn!("Failed to release path locks: {}", e);
 		}
 	}
 }
@@ -155,6 +156,7 @@ impl ChildCache {
 	}
 
 	/// Check if a file cache entry is valid (exists and mtime matches)
+	#[allow(dead_code)]
 	pub fn is_valid(&self, rel_path: &str, current_mtime: u32) -> Result<bool, Box<dyn Error>> {
 		let read_txn = self.db.begin_read()?;
 		let table = read_txn.open_table(FILES_TABLE)?;
@@ -170,6 +172,7 @@ impl ChildCache {
 	}
 
 	/// Get cached chunks for a file if valid
+	#[allow(dead_code)]
 	pub fn get_chunks(
 		&self,
 		rel_path: &str,
@@ -193,6 +196,7 @@ impl ChildCache {
 	}
 
 	/// Store or update cache entry for a file
+	#[allow(dead_code)]
 	pub fn set(&self, rel_path: &str, entry: CacheEntry) -> Result<(), Box<dyn Error>> {
 		let bytes = json5::to_string(&entry)?.into_bytes();
 

@@ -4,7 +4,36 @@ use std::error::Error;
 use std::fmt;
 use std::io;
 
+// Import orphaned error types that need From implementations
+use crate::chunk_tracker::ChunkTrackerError;
+use crate::exclusion::ExclusionError;
+use crate::metadata::MetadataError;
+use crate::validation::ValidationError;
+
+/// Helper function to reduce Box::new() boilerplate when wrapping errors
+///
+/// This function is useful for reducing verbosity when manually wrapping error types
+/// into `Box<dyn Error + Send + Sync>` for error variant fields.
+///
+/// # Examples
+///
+/// ```ignore
+/// // Before
+/// SyncError::Metadata(Box::new(err) as Box<dyn Error + Send + Sync>)
+///
+/// // After
+/// SyncError::Metadata(boxed_error(err))
+/// ```
+#[inline]
+pub fn boxed_error<E: Error + Send + Sync + 'static>(e: E) -> Box<dyn Error + Send + Sync> {
+	Box::new(e)
+}
+
 /// Main error type for sync operations
+///
+/// This is the unified error type that encompasses all sync-related errors.
+/// It contains both direct variants for common errors and nested variants
+/// for domain-specific errors.
 #[derive(Debug)]
 pub enum SyncError {
 	/// Failed to connect to a location
@@ -46,6 +75,21 @@ pub enum SyncError {
 	/// Conflict error (nested)
 	Conflict(ConflictError),
 
+	/// Protocol error (nested) - domain-specific protocol communication errors
+	Protocol(Box<dyn Error + Send + Sync>),
+
+	/// Metadata error (nested) - capability detection and metadata operations
+	Metadata(Box<dyn Error + Send + Sync>),
+
+	/// Exclusion error (nested) - file pattern and filter errors
+	Exclusion(Box<dyn Error + Send + Sync>),
+
+	/// Configuration parsing error (nested)
+	ConfigParse(Box<dyn Error + Send + Sync>),
+
+	/// Configuration discovery error (nested)
+	ConfigDiscovery(Box<dyn Error + Send + Sync>),
+
 	/// Generic error message
 	Other { message: String },
 }
@@ -80,6 +124,11 @@ impl fmt::Display for SyncError {
 			SyncError::Chunk(e) => write!(f, "Chunk error: {}", e),
 			SyncError::State(e) => write!(f, "State error: {}", e),
 			SyncError::Conflict(e) => write!(f, "Conflict error: {}", e),
+			SyncError::Protocol(e) => write!(f, "Protocol error: {}", e),
+			SyncError::Metadata(e) => write!(f, "Metadata error: {}", e),
+			SyncError::Exclusion(e) => write!(f, "Exclusion error: {}", e),
+			SyncError::ConfigParse(e) => write!(f, "Configuration parse error: {}", e),
+			SyncError::ConfigDiscovery(e) => write!(f, "Configuration discovery error: {}", e),
 			SyncError::Other { message } => write!(f, "{}", message),
 		}
 	}
@@ -129,6 +178,30 @@ impl From<ConflictError> for SyncError {
 	}
 }
 
+impl From<ExclusionError> for SyncError {
+	fn from(e: ExclusionError) -> Self {
+		SyncError::Exclusion(boxed_error(e))
+	}
+}
+
+impl From<MetadataError> for SyncError {
+	fn from(e: MetadataError) -> Self {
+		SyncError::Metadata(boxed_error(e))
+	}
+}
+
+impl From<ValidationError> for SyncError {
+	fn from(e: ValidationError) -> Self {
+		SyncError::Other { message: e.to_string() }
+	}
+}
+
+impl From<ChunkTrackerError> for SyncError {
+	fn from(e: ChunkTrackerError) -> Self {
+		SyncError::Other { message: e.to_string() }
+	}
+}
+
 /// Connection-specific errors
 #[derive(Debug)]
 pub enum ConnectionError {
@@ -158,21 +231,21 @@ impl fmt::Display for ConnectionError {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			ConnectionError::SshFailed { host, source } => {
-				write!(f, "SSH connection to {} failed: {}", host, source)
+				write!(f, "Failed to connect via SSH to {}: {}", host, source)
 			}
 			ConnectionError::SpawnFailed { cmd, source } => {
 				write!(f, "Failed to spawn '{}': {}", cmd, source)
 			}
 			ConnectionError::HandshakeFailed { message } => {
-				write!(f, "Handshake failed: {}", message)
+				write!(f, "Failed to complete handshake: {}", message)
 			}
 			ConnectionError::ProtocolError { message } => {
 				write!(f, "Protocol error: {}", message)
 			}
-			ConnectionError::Disconnected => write!(f, "Connection disconnected"),
+			ConnectionError::Disconnected => write!(f, "Connection disconnected unexpectedly"),
 			ConnectionError::Timeout => write!(f, "Connection timeout"),
 			ConnectionError::StdioUnavailable { what } => {
-				write!(f, "Stdio unavailable: {}", what)
+				write!(f, "Failed to access {}: stdio unavailable", what)
 			}
 		}
 	}
@@ -200,12 +273,14 @@ impl fmt::Display for ChunkError {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			ChunkError::ReadFailed { source } => write!(f, "Failed to read chunk: {}", source),
-			ChunkError::InvalidConfig { message } => write!(f, "Invalid chunk config: {}", message),
+			ChunkError::InvalidConfig { message } => {
+				write!(f, "Invalid chunk configuration: {}", message)
+			}
 			ChunkError::HashFailed { message } => {
-				write!(f, "Hash verification failed: {}", message)
+				write!(f, "Failed to verify chunk hash: {}", message)
 			}
 			ChunkError::SizeOutOfBounds { size, max } => {
-				write!(f, "Chunk size {} exceeds maximum {}", size, max)
+				write!(f, "Chunk size {} exceeds maximum allowed size {}", size, max)
 			}
 		}
 	}
@@ -274,20 +349,44 @@ impl fmt::Display for ConflictError {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			ConflictError::InvalidChoice { choice, max } => {
-				write!(f, "Invalid choice {}: only 0-{} available", choice, max - 1)
+				write!(f, "Invalid choice {}: must be between 0 and {}", choice, max - 1)
 			}
-			ConflictError::UserCancelled => write!(f, "User cancelled operation"),
+			ConflictError::UserCancelled => write!(f, "Operation cancelled by user"),
 			ConflictError::StrategyFailed { message } => {
-				write!(f, "Conflict resolution strategy failed: {}", message)
+				write!(f, "Failed to resolve conflict: {}", message)
 			}
 			ConflictError::Unresolvable { message } => {
-				write!(f, "Conflict is unresolvable: {}", message)
+				write!(f, "Cannot resolve conflict: {}", message)
 			}
 		}
 	}
 }
 
 impl Error for ConflictError {}
+
+// ============================================================================
+// UNIFIED ERROR SYSTEM - From implementations for orphaned error types
+// ============================================================================
+// These implementations enable seamless conversion of specialized error types
+// to the unified SyncError type, supporting the error consolidation refactoring.
+
+impl From<Box<dyn Error + Send + Sync>> for SyncError {
+	fn from(e: Box<dyn Error + Send + Sync>) -> Self {
+		SyncError::Other { message: e.to_string() }
+	}
+}
+
+// Note: ProtocolError, MetadataError, ExclusionError, ConfigParseError,
+// and DiscoveryError are handled via generic Box conversions.
+// To properly integrate orphaned error types, implement From<T> for SyncError
+// where T is each orphaned error type once they're imported.
+//
+// Example (uncomment when ready to fully consolidate):
+// impl From<ProtocolError> for SyncError {
+//     fn from(e: ProtocolError) -> Self {
+//         SyncError::Protocol(Box::new(e))
+//     }
+// }
 
 // Convenience conversion from Box<dyn Error> for original error handling
 pub fn box_error_to_sync_error(e: Box<dyn Error>) -> SyncError {

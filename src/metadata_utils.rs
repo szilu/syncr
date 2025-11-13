@@ -12,18 +12,16 @@ pub fn parse_file_metadata(buf: &str) -> Result<Box<FileData>, Box<dyn Error>> {
 	let fields = protocol_utils::parse_protocol_line(buf, 8)?;
 	let path = path::PathBuf::from(fields[1]);
 
-	let fd = Box::new(FileData {
-		tp: FileType::File,
-		path: path.clone(),
-		mode: fields[2].parse().map_err(|e| format!("Invalid mode '{}': {}", fields[2], e))?,
-		user: fields[3].parse().map_err(|e| format!("Invalid user '{}': {}", fields[3], e))?,
-		group: fields[4].parse().map_err(|e| format!("Invalid group '{}': {}", fields[4], e))?,
-		ctime: fields[5].parse().map_err(|e| format!("Invalid ctime '{}': {}", fields[5], e))?,
-		mtime: fields[6].parse().map_err(|e| format!("Invalid mtime '{}': {}", fields[6], e))?,
-		size: fields[7].parse().map_err(|e| format!("Invalid size '{}': {}", fields[7], e))?,
-		chunks: vec![],
-		target: None,
-	});
+	let fd = Box::new(
+		FileData::builder(FileType::File, path)
+			.mode(fields[2].parse().map_err(|e| format!("Invalid mode '{}': {}", fields[2], e))?)
+			.user(fields[3].parse().map_err(|e| format!("Invalid user '{}': {}", fields[3], e))?)
+			.group(fields[4].parse().map_err(|e| format!("Invalid group '{}': {}", fields[4], e))?)
+			.ctime(fields[5].parse().map_err(|e| format!("Invalid ctime '{}': {}", fields[5], e))?)
+			.mtime(fields[6].parse().map_err(|e| format!("Invalid mtime '{}': {}", fields[6], e))?)
+			.size(fields[7].parse().map_err(|e| format!("Invalid size '{}': {}", fields[7], e))?)
+			.build(),
+	);
 
 	Ok(fd)
 }
@@ -36,18 +34,16 @@ pub fn parse_dir_metadata(buf: &str) -> Result<Box<FileData>, Box<dyn Error>> {
 	let fields = protocol_utils::parse_protocol_line(buf, 7)?;
 	let path = path::PathBuf::from(fields[1]);
 
-	let fd = Box::new(FileData {
-		tp: FileType::Dir,
-		path: path.clone(),
-		mode: fields[2].parse().map_err(|e| format!("Invalid mode '{}': {}", fields[2], e))?,
-		user: fields[3].parse().map_err(|e| format!("Invalid user '{}': {}", fields[3], e))?,
-		group: fields[4].parse().map_err(|e| format!("Invalid group '{}': {}", fields[4], e))?,
-		ctime: fields[5].parse().map_err(|e| format!("Invalid ctime '{}': {}", fields[5], e))?,
-		mtime: fields[6].parse().map_err(|e| format!("Invalid mtime '{}': {}", fields[6], e))?,
-		size: 0,
-		chunks: vec![],
-		target: None,
-	});
+	let fd = Box::new(
+		FileData::builder(FileType::Dir, path)
+			.mode(fields[2].parse().map_err(|e| format!("Invalid mode '{}': {}", fields[2], e))?)
+			.user(fields[3].parse().map_err(|e| format!("Invalid user '{}': {}", fields[3], e))?)
+			.group(fields[4].parse().map_err(|e| format!("Invalid group '{}': {}", fields[4], e))?)
+			.ctime(fields[5].parse().map_err(|e| format!("Invalid ctime '{}': {}", fields[5], e))?)
+			.mtime(fields[6].parse().map_err(|e| format!("Invalid mtime '{}': {}", fields[6], e))?)
+			.size(0)
+			.build(),
+	);
 
 	Ok(fd)
 }
@@ -61,18 +57,17 @@ pub fn parse_symlink_metadata(buf: &str) -> Result<Box<FileData>, Box<dyn Error>
 	let path = path::PathBuf::from(fields[1]);
 	let target = if fields[7].is_empty() { None } else { Some(path::PathBuf::from(fields[7])) };
 
-	let fd = Box::new(FileData {
-		tp: FileType::SymLink,
-		path: path.clone(),
-		mode: fields[2].parse().map_err(|e| format!("Invalid mode '{}': {}", fields[2], e))?,
-		user: fields[3].parse().map_err(|e| format!("Invalid user '{}': {}", fields[3], e))?,
-		group: fields[4].parse().map_err(|e| format!("Invalid group '{}': {}", fields[4], e))?,
-		ctime: fields[5].parse().map_err(|e| format!("Invalid ctime '{}': {}", fields[5], e))?,
-		mtime: fields[6].parse().map_err(|e| format!("Invalid mtime '{}': {}", fields[6], e))?,
-		size: 0,
-		chunks: vec![],
-		target,
-	});
+	let fd = Box::new(
+		FileData::builder(FileType::SymLink, path)
+			.mode(fields[2].parse().map_err(|e| format!("Invalid mode '{}': {}", fields[2], e))?)
+			.user(fields[3].parse().map_err(|e| format!("Invalid user '{}': {}", fields[3], e))?)
+			.group(fields[4].parse().map_err(|e| format!("Invalid group '{}': {}", fields[4], e))?)
+			.ctime(fields[5].parse().map_err(|e| format!("Invalid ctime '{}': {}", fields[5], e))?)
+			.mtime(fields[6].parse().map_err(|e| format!("Invalid mtime '{}': {}", fields[6], e))?)
+			.size(0)
+			.target(target)
+			.build(),
+	);
 
 	Ok(fd)
 }

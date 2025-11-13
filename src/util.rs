@@ -1,4 +1,51 @@
+//! Utility functions for SyncR
+//!
+//! This module contains helper functions including safe wrappers around
+//! system calls that require unsafe blocks.
+//!
+//! Note: Some functions in this module are used by Phase E and later features
+//! and may appear unused when those phases haven't been integrated yet.
+#![allow(dead_code)]
+
 use base64::engine::Engine;
+
+/// Get the effective user ID of the current process
+///
+/// Returns the effective UID on Unix systems, or a default value on other platforms.
+/// This function wraps the unsafe libc call in a safe interface.
+#[allow(unsafe_code)] // Safe wrapper around system call
+pub fn get_effective_uid() -> u32 {
+	#[cfg(unix)]
+	{
+		// SAFETY: geteuid() is always safe to call - it just returns a value
+		// from the process credentials without any side effects.
+		unsafe { libc::geteuid() }
+	}
+
+	#[cfg(not(unix))]
+	{
+		1000 // Default non-root UID on non-Unix platforms
+	}
+}
+
+/// Get the effective group ID of the current process
+///
+/// Returns the effective GID on Unix systems, or a default value on other platforms.
+/// This function wraps the unsafe libc call in a safe interface.
+#[allow(unsafe_code)] // Safe wrapper around system call
+pub fn get_effective_gid() -> u32 {
+	#[cfg(unix)]
+	{
+		// SAFETY: getegid() is always safe to call - it just returns a value
+		// from the process credentials without any side effects.
+		unsafe { libc::getegid() }
+	}
+
+	#[cfg(not(unix))]
+	{
+		1000 // Default GID on non-Unix platforms
+	}
+}
 
 /// Hash a buffer using BLAKE3 and return base64-encoded result
 pub fn hash(buf: &[u8]) -> String {

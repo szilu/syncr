@@ -119,6 +119,11 @@ impl crate::sync_impl::SyncProgressCallback for TuiBridge {
 					});
 				}
 			}
+
+			SyncCallbackEvent::ProtocolVersionSelected { version: _ } => {
+				// Log the protocol version selection
+				// This is informational only, no TUI event needed
+			}
 		}
 	}
 }

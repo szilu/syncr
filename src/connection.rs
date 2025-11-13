@@ -1,6 +1,6 @@
 //! Connection management for local and remote sync nodes
 
-use crate::error::ConnectionError;
+use crate::error::{boxed_error, ConnectionError};
 use std::path::PathBuf;
 use std::process::Stdio;
 use tokio::io::BufReader;
@@ -74,7 +74,10 @@ pub async fn connect(location: &str) -> Result<Node, ConnectionError> {
 			.stdin(Stdio::piped())
 			.stdout(Stdio::piped())
 			.spawn()
-			.map_err(|e| ConnectionError::SshFailed { host: host.clone(), source: Box::new(e) })?,
+			.map_err(|e| ConnectionError::SshFailed {
+				host: host.clone(),
+				source: boxed_error(e),
+			})?,
 		ConnectionType::Local { path } => tokio::process::Command::new("syncr")
 			.arg("serve")
 			.arg(path)

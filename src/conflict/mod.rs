@@ -3,6 +3,13 @@
 use crate::types::FileData;
 use std::path::PathBuf;
 
+pub mod resolver;
+pub mod rules;
+
+pub use resolver::ConflictResolver;
+
+// Re-export the error type
+
 /// Represents a sync conflict between nodes
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -106,7 +113,50 @@ impl Conflict {
 	pub fn smallest_version(&self) -> Option<usize> {
 		self.versions.iter().enumerate().min_by_key(|(_, v)| v.size()).map(|(i, _)| i)
 	}
+
+	/// Find a version by node name/location
+	#[allow(dead_code)]
+	pub fn version_by_name(&self, name: &str) -> Option<usize> {
+		self.versions
+			.iter()
+			.enumerate()
+			.find(|(_, v)| v.node_location == name)
+			.map(|(i, _)| i)
+	}
 }
+
+/// Error type for conflict resolution
+#[derive(Debug)]
+pub enum ConflictResolutionError {
+	/// No versions available
+	NoVersions,
+
+	/// Invalid version index
+	InvalidVersion(usize),
+
+	/// Node not found
+	NodeNotFound(String),
+
+	/// Strategy cannot be applied
+	StrategyNotApplicable(String),
+}
+
+impl std::fmt::Display for ConflictResolutionError {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			ConflictResolutionError::NoVersions => write!(f, "No versions available"),
+			ConflictResolutionError::InvalidVersion(idx) => {
+				write!(f, "Invalid version index: {}", idx)
+			}
+			ConflictResolutionError::NodeNotFound(name) => write!(f, "Node not found: {}", name),
+			ConflictResolutionError::StrategyNotApplicable(msg) => {
+				write!(f, "Strategy not applicable: {}", msg)
+			}
+		}
+	}
+}
+
+impl std::error::Error for ConflictResolutionError {}
 
 #[cfg(test)]
 mod tests {
@@ -114,18 +164,14 @@ mod tests {
 	use crate::types::FileType;
 
 	fn create_test_file(mtime: u32, size: u64) -> FileData {
-		FileData {
-			tp: FileType::File,
-			path: PathBuf::from("test.txt"),
-			mode: 0o644,
-			user: 1000,
-			group: 1000,
-			ctime: 0,
-			mtime,
-			size,
-			chunks: vec![],
-			target: None,
-		}
+		FileData::builder(FileType::File, PathBuf::from("test.txt"))
+			.mode(0o644)
+			.user(1000)
+			.group(1000)
+			.ctime(0)
+			.mtime(mtime)
+			.size(size)
+			.build()
 	}
 
 	#[test]
@@ -182,6 +228,27 @@ mod tests {
 			Conflict::new(1, PathBuf::from("test.txt"), ConflictType::ModifyModify, vec![v1, v2]);
 
 		assert_eq!(conflict.largest_version(), Some(1));
+	}
+
+	#[test]
+	fn test_version_by_name() {
+		let v1 = FileVersion {
+			node_index: 0,
+			node_location: "node1".to_string(),
+			file_data: create_test_file(100, 1024),
+		};
+		let v2 = FileVersion {
+			node_index: 1,
+			node_location: "server:/data".to_string(),
+			file_data: create_test_file(100, 2048),
+		};
+
+		let conflict =
+			Conflict::new(1, PathBuf::from("test.txt"), ConflictType::ModifyModify, vec![v1, v2]);
+
+		assert_eq!(conflict.version_by_name("server:/data"), Some(1));
+		assert_eq!(conflict.version_by_name("node1"), Some(0));
+		assert_eq!(conflict.version_by_name("nonexistent"), None);
 	}
 }
 

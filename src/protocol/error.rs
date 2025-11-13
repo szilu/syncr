@@ -19,6 +19,18 @@ pub enum ProtocolError {
 	ProtocolViolation(String),
 	/// Generic error message
 	Other(String),
+	/// No common protocol version between nodes
+	NoCommonVersion { capabilities: Vec<Vec<u32>> },
+	/// Invalid version format in negotiation message
+	InvalidVersionFormat(String),
+	/// Server doesn't support the requested version
+	UnsupportedVersionRequested { requested: u32, supported: Vec<u32> },
+	/// Capabilities exchange failed
+	CapabilitiesExchangeFailed(String),
+	/// Version selection timed out
+	VersionSelectionTimeout,
+	/// Server did not acknowledge version selection
+	ServerDidNotAcknowledgeVersion,
 }
 
 impl fmt::Display for ProtocolError {
@@ -29,6 +41,28 @@ impl fmt::Display for ProtocolError {
 			ProtocolError::Base64(msg) => write!(f, "Base64 decode error: {}", msg),
 			ProtocolError::ProtocolViolation(msg) => write!(f, "Protocol violation: {}", msg),
 			ProtocolError::Other(msg) => write!(f, "{}", msg),
+			ProtocolError::NoCommonVersion { capabilities } => {
+				write!(
+					f,
+					"No common protocol version between nodes. Capabilities: {:?}",
+					capabilities
+				)
+			}
+			ProtocolError::InvalidVersionFormat(msg) => {
+				write!(f, "Invalid version format: {}", msg)
+			}
+			ProtocolError::UnsupportedVersionRequested { requested, supported } => {
+				write!(f, "Unsupported version {} requested. Supported: {:?}", requested, supported)
+			}
+			ProtocolError::CapabilitiesExchangeFailed(msg) => {
+				write!(f, "Capabilities exchange failed: {}", msg)
+			}
+			ProtocolError::VersionSelectionTimeout => {
+				write!(f, "Version selection timed out waiting for server response")
+			}
+			ProtocolError::ServerDidNotAcknowledgeVersion => {
+				write!(f, "Server did not acknowledge version selection")
+			}
 		}
 	}
 }

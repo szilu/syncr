@@ -1,22 +1,8 @@
 //! State management and persistence for sync operations
 
-use crate::error::StateError;
-use crate::types::FileData;
-use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use crate::error::{boxed_error, StateError};
+use crate::types::PreviousSyncState;
 use std::path::{Path, PathBuf};
-
-/// Previous sync state for three-way merge detection
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PreviousSyncState {
-	/// Files from previous sync, keyed by path
-	#[serde(rename = "fl")]
-	pub files: BTreeMap<String, FileData>,
-
-	/// Timestamp of previous sync
-	#[serde(rename = "ts")]
-	pub timestamp: u64,
-}
 
 /// Persistent state manager for sync profiles
 pub struct StateManager {
@@ -40,7 +26,7 @@ impl StateManager {
 
 		let contents = tokio::fs::read_to_string(&path)
 			.await
-			.map_err(|e| StateError::LoadFailed { source: Box::new(e) })?;
+			.map_err(|e| StateError::LoadFailed { source: boxed_error(e) })?;
 
 		json5::from_str(&contents).map_err(|e| StateError::Corrupted {
 			message: format!("Failed to parse state JSON: {}", e),
@@ -55,15 +41,15 @@ impl StateManager {
 		if !path.parent().unwrap_or(Path::new(".")).exists() {
 			tokio::fs::create_dir_all(path.parent().unwrap_or(Path::new(".")))
 				.await
-				.map_err(|e| StateError::SaveFailed { source: Box::new(e) })?;
+				.map_err(|e| StateError::SaveFailed { source: boxed_error(e) })?;
 		}
 
-		let json =
-			json5::to_string(state).map_err(|e| StateError::SaveFailed { source: Box::new(e) })?;
+		let json = json5::to_string(state)
+			.map_err(|e| StateError::SaveFailed { source: boxed_error(e) })?;
 
 		tokio::fs::write(&path, json)
 			.await
-			.map_err(|e| StateError::SaveFailed { source: Box::new(e) })
+			.map_err(|e| StateError::SaveFailed { source: boxed_error(e) })
 	}
 
 	/// Delete saved state
@@ -73,7 +59,7 @@ impl StateManager {
 		if path.exists() {
 			tokio::fs::remove_file(&path)
 				.await
-				.map_err(|e| StateError::SaveFailed { source: Box::new(e) })?;
+				.map_err(|e| StateError::SaveFailed { source: boxed_error(e) })?;
 		}
 
 		Ok(())

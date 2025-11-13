@@ -1,10 +1,22 @@
 //! Signal handlers for graceful termination
+//!
+//! NOTE: Signal handlers are spawned but graceful shutdown is handled through
+//! normal application flows. Do NOT call std::process::exit() directly as it
+//! bypasses Drop implementations and terminal cleanup code (TerminalGuard, etc).
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, warn};
+
+/// Shared shutdown flag for signal handlers
+pub static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 /// Setup signal handlers for graceful cleanup on termination
 /// With path-level locking in the cache DB, locks are automatically
 /// released when the process exits.
+///
+/// NOTE: This sets a shutdown flag but does NOT call exit(). The main application
+/// loop must check this flag and perform cleanup before exiting.
+#[allow(dead_code)]
 pub fn setup_signal_handlers() {
 	// Spawn a task to handle signals
 	tokio::spawn(async {
@@ -28,12 +40,12 @@ pub fn setup_signal_handlers() {
 
 		tokio::select! {
 			_ = sigterm.recv() => {
-				debug!("Received SIGTERM, exiting gracefully...");
-				std::process::exit(143); // 128 + SIGTERM(15)
+				debug!("Received SIGTERM, requesting graceful shutdown...");
+				SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
 			}
 			_ = sigint.recv() => {
-				debug!("Received SIGINT, exiting gracefully...");
-				std::process::exit(130); // 128 + SIGINT(2)
+				debug!("Received SIGINT, requesting graceful shutdown...");
+				SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
 			}
 		}
 	});

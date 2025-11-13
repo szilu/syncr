@@ -6,16 +6,8 @@ use std::collections::BTreeMap;
 use std::path;
 use std::time::Duration;
 
-/// Configuration (kept for backward compatibility with existing code)
-#[derive(Debug, Clone)]
-pub struct Config {
-	pub syncr_dir: path::PathBuf,
-	pub profile: String,
-}
-
 /// Sync operation phases
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum SyncPhase {
 	/// Initializing sync session
 	Initializing,
@@ -161,11 +153,31 @@ impl<'de> Deserialize<'de> for HashChunk {
 	}
 }
 
-#[derive(Clone, PartialEq, Debug, SerdeSerialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug, SerdeSerialize)]
 pub enum FileType {
 	File,
 	Dir,
 	SymLink,
+}
+
+// Custom Deserialize for FileType to handle both "F"/"D"/"L" format (saved by Serialize impl)
+// and full names "File"/"Dir"/"SymLink" (for compatibility)
+impl<'de> serde::Deserialize<'de> for FileType {
+	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+	where
+		D: serde::Deserializer<'de>,
+	{
+		let s = String::deserialize(deserializer)?;
+		match s.as_str() {
+			"F" | "File" => Ok(FileType::File),
+			"D" | "Dir" => Ok(FileType::Dir),
+			"L" | "SymLink" => Ok(FileType::SymLink),
+			_ => Err(serde::de::Error::unknown_variant(
+				&s,
+				&["F", "D", "L", "File", "Dir", "SymLink"],
+			)),
+		}
+	}
 }
 
 #[derive(Clone, PartialEq, Debug, Deserialize)]
@@ -217,13 +229,108 @@ impl Serialize for FileData {
 	}
 }
 
-/// File operation type for tracking changes across syncs
-#[derive(Clone, PartialEq, Debug)]
-#[allow(dead_code)]
-pub enum FileOperation {
-	Create,
-	Modify,
-	Delete,
+/// Builder for FileData construction
+#[derive(Clone, Debug)]
+pub struct FileDataBuilder {
+	tp: FileType,
+	path: path::PathBuf,
+	mode: u32,
+	user: u32,
+	group: u32,
+	ctime: u32,
+	mtime: u32,
+	size: u64,
+	chunks: Vec<HashChunk>,
+	target: Option<path::PathBuf>,
+}
+
+impl FileDataBuilder {
+	/// Create a new FileData builder with required fields
+	pub fn new(tp: FileType, path: path::PathBuf) -> Self {
+		FileDataBuilder {
+			tp,
+			path,
+			mode: 0,
+			user: 0,
+			group: 0,
+			ctime: 0,
+			mtime: 0,
+			size: 0,
+			chunks: Vec::new(),
+			target: None,
+		}
+	}
+
+	/// Set the file mode (permissions)
+	pub fn mode(mut self, mode: u32) -> Self {
+		self.mode = mode;
+		self
+	}
+
+	/// Set the file owner user ID
+	pub fn user(mut self, user: u32) -> Self {
+		self.user = user;
+		self
+	}
+
+	/// Set the file group ID
+	pub fn group(mut self, group: u32) -> Self {
+		self.group = group;
+		self
+	}
+
+	/// Set the creation time
+	pub fn ctime(mut self, ctime: u32) -> Self {
+		self.ctime = ctime;
+		self
+	}
+
+	/// Set the modification time
+	pub fn mtime(mut self, mtime: u32) -> Self {
+		self.mtime = mtime;
+		self
+	}
+
+	/// Set the file size
+	pub fn size(mut self, size: u64) -> Self {
+		self.size = size;
+		self
+	}
+
+	/// Set the file chunks
+	pub fn chunks(mut self, chunks: Vec<HashChunk>) -> Self {
+		self.chunks = chunks;
+		self
+	}
+
+	/// Set the symlink target
+	pub fn target(mut self, target: Option<path::PathBuf>) -> Self {
+		self.target = target;
+		self
+	}
+
+	/// Build the FileData instance
+	pub fn build(self) -> FileData {
+		FileData {
+			tp: self.tp,
+			path: self.path,
+			mode: self.mode,
+			user: self.user,
+			group: self.group,
+			ctime: self.ctime,
+			mtime: self.mtime,
+			size: self.size,
+			chunks: self.chunks,
+			target: self.target,
+		}
+	}
+}
+
+impl FileData {
+	/// Create a builder for constructing FileData
+	pub fn builder(tp: FileType, path: path::PathBuf) -> FileDataBuilder {
+		FileDataBuilder::new(tp, path)
+	}
 }
 
 /// State from a previous sync, used for three-way merge detection
@@ -238,6 +345,7 @@ pub struct PreviousSyncState {
 #[cfg(test)]
 mod test {
 	use super::*;
+	use crate::config::Config;
 
 	#[test]
 	fn test_file_type_equality() {
@@ -349,6 +457,7 @@ mod test {
 		let config = Config {
 			syncr_dir: path::PathBuf::from("/home/user/.syncr"),
 			profile: String::from("test"),
+			..Default::default()
 		};
 		assert_eq!(config.syncr_dir, path::PathBuf::from("/home/user/.syncr"));
 		assert_eq!(config.profile, "test");

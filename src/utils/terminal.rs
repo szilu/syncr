@@ -1,10 +1,12 @@
 //! Terminal mode management for raw input handling
 
+use std::io::Write;
 use termios::{tcsetattr, Termios, ECHO, ICANON, TCSANOW};
 
 /// RAII guard for raw terminal input mode
 /// Disables line buffering (ICANON) and character echo (ECHO)
 /// Automatically restores terminal settings on drop
+#[allow(dead_code)]
 pub struct TerminalGuard {
 	fd: i32,
 	original: Termios,
@@ -13,6 +15,7 @@ pub struct TerminalGuard {
 impl TerminalGuard {
 	/// Enable raw terminal mode on stdin
 	/// Returns None if not connected to a terminal
+	#[allow(dead_code)]
 	pub fn new() -> Option<Self> {
 		let fd = 0; // stdin
 		let original = match Termios::from_fd(fd) {
@@ -30,9 +33,29 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
 	fn drop(&mut self) {
-		// Restore terminal even if panic occurs
-		let _ = tcsetattr(self.fd, TCSANOW, &self.original);
+		restore_terminal_state();
 	}
+}
+
+/// Restore terminal to normal state
+/// Called by TerminalGuard drop and panic hooks
+pub fn restore_terminal_state() {
+	// Flush output
+	let _ = std::io::stdout().flush();
+	let _ = std::io::stderr().flush();
+
+	// Try to restore with termios
+	if let Ok(term) = Termios::from_fd(0) {
+		// Reset flags to normal values (line buffering + echo)
+		let mut normal_termios = term;
+		normal_termios.c_lflag |= ICANON | ECHO;
+		let _ = tcsetattr(0, TCSANOW, &normal_termios);
+	}
+
+	// Show cursor if it's hidden (ANSI escape sequence)
+	let _ = write!(std::io::stdout(), "\x1B[?25h");
+	let _ = write!(std::io::stdout(), "\r\n"); // Move to fresh line
+	let _ = std::io::stdout().flush();
 }
 
 #[cfg(test)]

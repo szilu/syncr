@@ -5,16 +5,18 @@ use std::error::Error;
 use std::path;
 use tokio::sync::Mutex;
 
-use crate::protocol::{FileSystemEntryType, SyncProtocol};
+use crate::metadata::NodeCapabilities;
+use crate::protocol::{FileSystemEntryType, ProtocolClient};
 use crate::types::{FileData, FileType};
 
 /// State for a single sync node (local or remote)
 pub struct NodeState {
 	pub id: u8,
-	pub protocol: Mutex<Box<dyn SyncProtocol>>,
+	pub protocol: Mutex<Box<dyn ProtocolClient>>,
 	pub dir: BTreeMap<path::PathBuf, Box<FileData>>,
-	pub chunks: BTreeSet<[u8; 32]>,       // Binary BLAKE3 hashes
-	pub missing: Mutex<BTreeSet<String>>, // Base64-encoded hashes needing transfer
+	pub chunks: BTreeSet<[u8; 32]>,             // Binary BLAKE3 hashes
+	pub missing: Mutex<BTreeSet<String>>,       // Base64-encoded hashes needing transfer
+	pub capabilities: Option<NodeCapabilities>, // Node capabilities (detected during sync)
 }
 
 impl PartialEq for NodeState {
@@ -54,7 +56,7 @@ impl NodeState {
 			size: file.size,
 			target: file.target.clone(),
 			chunks,
-			needs_data_transfer: trans_data,
+			needs_data_transfer: Some(trans_data),
 		};
 
 		let mut protocol = self.protocol.lock().await;
@@ -69,7 +71,6 @@ impl NodeState {
 	where
 		F: FnMut(usize, u64),
 	{
-		let mut current_file: Option<path::PathBuf> = None;
 		let mut files_count = 0;
 		let mut bytes_count = 0u64;
 		let mut last_update = std::time::Instant::now();
@@ -93,64 +94,58 @@ impl NodeState {
 
 			match entry.entry_type {
 				FileSystemEntryType::File => {
-					// If this is a file with chunk data (not just a chunk reference)
-					if !entry.path.as_os_str().is_empty() {
-						let fd = Box::new(FileData {
-							path: entry.path.clone(),
-							tp: FileType::File,
-							mode: entry.mode,
-							user: entry.user_id,
-							group: entry.group_id,
-							ctime: entry.created_time,
-							mtime: entry.modified_time,
-							size: entry.size,
-							chunks: Vec::new(),
-							target: None,
-						});
+					// Convert protocol chunks to FileData chunks
+					let chunks: Vec<crate::types::HashChunk> = entry
+						.chunks
+						.iter()
+						.map(|c| crate::types::HashChunk {
+							hash: c.hash,
+							offset: c.offset,
+							size: c.size,
+						})
+						.collect();
 
-						bytes_count += fd.size;
-						files_count += 1;
-						self.dir.insert(entry.path.clone(), fd);
-						current_file = Some(entry.path.clone());
+					// Track chunks for deduplication
+					for chunk in &chunks {
+						self.chunks.insert(chunk.hash);
+					}
 
-						// Send progress update every 100 files or every 200ms
-						if files_count % 100 == 0 || last_update.elapsed().as_millis() >= 200 {
-							progress_callback(files_count, bytes_count);
-							last_update = std::time::Instant::now();
-						}
-					} else {
-						// This is a chunk reference for the current file
-						if let Some(ref file_path) = current_file {
-							if let Some(file_data) = self.dir.get_mut(file_path) {
-								for chunk_info in &entry.chunks {
-									file_data.chunks.push(crate::types::HashChunk {
-										hash: chunk_info.hash,
-										offset: chunk_info.offset,
-										size: chunk_info.size,
-									});
-									self.chunks.insert(chunk_info.hash);
-								}
-							}
-						}
+					let fd = Box::new(
+						FileData::builder(FileType::File, entry.path.clone())
+							.mode(entry.mode)
+							.user(entry.user_id)
+							.group(entry.group_id)
+							.ctime(entry.created_time)
+							.mtime(entry.modified_time)
+							.size(entry.size)
+							.chunks(chunks)
+							.build(),
+					);
+
+					bytes_count += fd.size;
+					files_count += 1;
+					self.dir.insert(entry.path.clone(), fd);
+
+					// Send progress update every 100 files or every 200ms
+					if files_count % 100 == 0 || last_update.elapsed().as_millis() >= 200 {
+						progress_callback(files_count, bytes_count);
+						last_update = std::time::Instant::now();
 					}
 				}
 				FileSystemEntryType::Directory => {
-					let fd = Box::new(FileData {
-						path: entry.path.clone(),
-						tp: FileType::Dir,
-						mode: entry.mode,
-						user: entry.user_id,
-						group: entry.group_id,
-						ctime: entry.created_time,
-						mtime: entry.modified_time,
-						size: 0,
-						chunks: Vec::new(),
-						target: None,
-					});
+					let fd = Box::new(
+						FileData::builder(FileType::Dir, entry.path.clone())
+							.mode(entry.mode)
+							.user(entry.user_id)
+							.group(entry.group_id)
+							.ctime(entry.created_time)
+							.mtime(entry.modified_time)
+							.size(0)
+							.build(),
+					);
 
 					files_count += 1;
 					self.dir.insert(entry.path.clone(), fd);
-					current_file = None;
 
 					// Send progress update every 100 files or every 200ms
 					if files_count % 100 == 0 || last_update.elapsed().as_millis() >= 200 {
@@ -159,22 +154,20 @@ impl NodeState {
 					}
 				}
 				FileSystemEntryType::SymLink => {
-					let fd = Box::new(FileData {
-						path: entry.path.clone(),
-						tp: FileType::SymLink,
-						mode: entry.mode,
-						user: entry.user_id,
-						group: entry.group_id,
-						ctime: entry.created_time,
-						mtime: entry.modified_time,
-						size: 0,
-						chunks: Vec::new(),
-						target: entry.target,
-					});
+					let fd = Box::new(
+						FileData::builder(FileType::SymLink, entry.path.clone())
+							.mode(entry.mode)
+							.user(entry.user_id)
+							.group(entry.group_id)
+							.ctime(entry.created_time)
+							.mtime(entry.modified_time)
+							.size(0)
+							.target(entry.target)
+							.build(),
+					);
 
 					files_count += 1;
 					self.dir.insert(entry.path.clone(), fd);
-					current_file = None;
 
 					// Send progress update every 100 files or every 200ms
 					if files_count % 100 == 0 || last_update.elapsed().as_millis() >= 200 {

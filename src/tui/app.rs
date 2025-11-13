@@ -7,16 +7,46 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::error::Error;
-use std::io;
+use std::io::{self, Write};
 use tokio::sync::{broadcast, mpsc};
 
-use crate::types::Config;
+use crate::config::Config;
 
 use super::{
 	event::{SyncEvent, TickGenerator},
 	state::{AppState, LogLevel, ViewType},
 	views,
 };
+
+/// RAII guard for TUI terminal state
+/// Ensures terminal is properly cleaned up even if panic occurs or signal is received
+struct TuiGuard;
+
+impl TuiGuard {
+	/// Setup terminal in raw mode with alternate screen
+	fn new() -> Result<Self, Box<dyn Error>> {
+		enable_raw_mode()?;
+		Ok(TuiGuard)
+	}
+}
+
+impl Drop for TuiGuard {
+	fn drop(&mut self) {
+		// Restore terminal even if panic occurs or signal is received
+		// This is critical because signal handlers no longer call exit()
+
+		// Disable raw mode
+		let _ = disable_raw_mode();
+
+		// Restore alternate screen and mouse
+		let mut stdout = io::stdout();
+		let _ = execute!(stdout, LeaveAlternateScreen, DisableMouseCapture);
+
+		// Show cursor if it's hidden
+		let _ = write!(io::stdout(), "\x1B[?25h");
+		let _ = io::stdout().flush();
+	}
+}
 
 /// Commands sent from TUI to sync engine
 #[derive(Debug, Clone)]
@@ -137,6 +167,11 @@ impl TuiApp {
 		// Wait for sync thread to finish (cleanup, lock file deletion, etc.)
 		// This ensures proper cleanup even if the sync thread is still running
 		if let Some(handle) = self.sync_thread.take() {
+			// Drop the conflict resolution sender to unblock the sync thread if it's waiting
+			// This ensures the receiver in the sync thread gets Err(RecvError::Disconnected)
+			// allowing it to break out of the conflict resolution wait loop
+			self.state.sync.conflict_resolution_tx = None;
+
 			eprintln!("Waiting for sync thread to finish...");
 			let _ = handle.join();
 			eprintln!("Sync thread finished");
@@ -541,6 +576,10 @@ impl TuiApp {
 
 /// Entry point for TUI mode
 pub async fn run_tui(config: Config, dirs: Vec<&str>) -> Result<(), Box<dyn Error>> {
+	// Setup terminal with automatic cleanup on drop
+	// This guard ensures the terminal is restored even if panic occurs or signal is received
+	let _tui_guard = TuiGuard::new()?;
+
 	// Create broadcast channel for sync events FIRST
 	// This must happen before initializing tracing
 	let (event_tx, event_rx) = broadcast::channel(100);
@@ -549,8 +588,7 @@ pub async fn run_tui(config: Config, dirs: Vec<&str>) -> Result<(), Box<dyn Erro
 	// Parent tracing events (including re-emitted child logs) go through this channel
 	crate::logging::init_tui_tracing(event_tx.clone());
 
-	// Setup terminal
-	enable_raw_mode()?;
+	// Setup alternate screen and mouse capture
 	let mut stdout = io::stdout();
 	execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
 	let backend = CrosstermBackend::new(stdout);
@@ -576,14 +614,8 @@ pub async fn run_tui(config: Config, dirs: Vec<&str>) -> Result<(), Box<dyn Erro
 	// See handle_key() -> spawn_sync() flow (triggered by Setup -> Sync view transition)
 
 	// Run TUI event loop
-	let tui_result = app.run(&mut terminal).await;
-
-	// Cleanup terminal
-	disable_raw_mode()?;
-	execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
-	terminal.show_cursor()?;
-
-	tui_result
+	// Terminal cleanup (raw mode, alternate screen) happens automatically when _tui_guard drops
+	app.run(&mut terminal).await
 }
 
 // vim: ts=4

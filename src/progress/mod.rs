@@ -19,10 +19,17 @@ use crate::types::SyncPhase;
 pub use constants::*;
 
 /// Per-node collection statistics
+///
+/// Statistics about file and byte counts collected per node during sync operations.
+/// This struct is part of the public API for metrics and progress tracking.
+/// Previously was marked pub(crate), made public to match visibility of ProgressState::node_stats field.
 #[derive(Debug, Clone)]
-pub(crate) struct NodeCollectionStats {
-	pub(crate) files: usize,
-	pub(crate) bytes: u64,
+pub struct NodeCollectionStats {
+	/// Number of files collected from this node
+	pub files: usize,
+
+	/// Total bytes collected from this node
+	pub bytes: u64,
 }
 
 /// Shared state for progress tracking

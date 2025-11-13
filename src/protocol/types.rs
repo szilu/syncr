@@ -6,19 +6,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// Protocol version identifier
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProtocolVersion {
-	V3,
-}
-
-impl std::fmt::Display for ProtocolVersion {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		match self {
-			ProtocolVersion::V3 => write!(f, "3"),
-		}
-	}
-}
+// Re-export NodeCapabilities from metadata module for use in protocol
+pub use crate::metadata::NodeCapabilities;
 
 /// Type of file system entry
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,6 +29,10 @@ pub struct ChunkInfo {
 }
 
 /// A file system entry (file, directory, or symlink) with metadata
+///
+/// This struct represents a file system entry with all its metadata and chunks.
+/// The `needs_data_transfer` field indicates whether chunk data should be transferred
+/// during sync operations (None = not applicable, Some(true) = needs transfer, Some(false) = doesn't need)
 #[derive(Debug, Clone)]
 pub struct FileSystemEntry {
 	pub entry_type: FileSystemEntryType,
@@ -52,48 +45,90 @@ pub struct FileSystemEntry {
 	pub size: u64,
 	pub target: Option<PathBuf>, // For symlinks
 	pub chunks: Vec<ChunkInfo>,  // For files
+	/// Whether chunk data needs to be transferred (merged from MetadataEntry)
+	/// Default: None (not specified during normal traversal)
+	pub needs_data_transfer: Option<bool>,
 }
 
-/// Metadata entry to send during sync
-#[derive(Debug, Clone)]
-pub struct MetadataEntry {
-	pub entry_type: FileSystemEntryType,
-	pub path: PathBuf,
-	pub mode: u32,
-	pub user_id: u32,
-	pub group_id: u32,
-	pub created_time: u32,
-	pub modified_time: u32,
-	pub size: u64,
-	pub target: Option<PathBuf>,
-	pub chunks: Vec<ChunkInfo>,
-	pub needs_data_transfer: bool,
+impl FileSystemEntry {
+	/// Create a new FileSystemEntry without data transfer requirement
+	#[allow(clippy::too_many_arguments)]
+	pub fn new(
+		entry_type: FileSystemEntryType,
+		path: PathBuf,
+		mode: u32,
+		user_id: u32,
+		group_id: u32,
+		created_time: u32,
+		modified_time: u32,
+		size: u64,
+		target: Option<PathBuf>,
+		chunks: Vec<ChunkInfo>,
+	) -> Self {
+		Self {
+			entry_type,
+			path,
+			mode,
+			user_id,
+			group_id,
+			created_time,
+			modified_time,
+			size,
+			target,
+			chunks,
+			needs_data_transfer: None,
+		}
+	}
+
+	/// Create a new FileSystemEntry with explicit data transfer requirement
+	#[allow(clippy::too_many_arguments)]
+	pub fn with_data_transfer(
+		entry_type: FileSystemEntryType,
+		path: PathBuf,
+		mode: u32,
+		user_id: u32,
+		group_id: u32,
+		created_time: u32,
+		modified_time: u32,
+		size: u64,
+		target: Option<PathBuf>,
+		chunks: Vec<ChunkInfo>,
+		needs_data_transfer: bool,
+	) -> Self {
+		Self {
+			entry_type,
+			path,
+			mode,
+			user_id,
+			group_id,
+			created_time,
+			modified_time,
+			size,
+			target,
+			chunks,
+			needs_data_transfer: Some(needs_data_transfer),
+		}
+	}
 }
+
+/// Type alias for backward compatibility
+/// MetadataEntry was merged into FileSystemEntry with needs_data_transfer as Option<bool>
+pub type MetadataEntry = FileSystemEntry;
 
 /// Received chunk with binary data
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ChunkData {
 	pub hash: String, // Base64-encoded hash for identification
 	pub data: Vec<u8>,
 }
 
 /// Response from commit operation
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CommitResponse {
 	pub success: bool,
 	pub message: Option<String>,
 	pub renamed_count: Option<usize>,
 	pub failed_count: Option<usize>,
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	#[test]
-	fn test_protocol_version_display() {
-		assert_eq!(ProtocolVersion::V3.to_string(), "3");
-	}
 }
 
 // vim: ts=4

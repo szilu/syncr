@@ -5,8 +5,9 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use super::event::ProgressStats;
+use crate::config::Config;
 use crate::node_labels::generate_node_labels;
-use crate::types::{Config, SyncPhase, SyncResult};
+use crate::types::{SyncPhase, SyncResult};
 
 /// Main application state
 pub struct AppState {
@@ -90,6 +91,8 @@ pub struct SyncState {
 	pub is_running: bool,
 
 	/// Channel for sending conflict resolutions to the sync engine
+	/// Uses ConflictResolution struct from sync_impl module
+	/// (formerly named ConflictResolutionMessage, renamed for clarity)
 	pub conflict_resolution_tx:
 		Option<std::sync::mpsc::Sender<crate::sync_impl::ConflictResolution>>,
 }
@@ -338,6 +341,7 @@ mod tests {
 		let config = Config {
 			syncr_dir: std::path::PathBuf::from("/tmp/.syncr"),
 			profile: "test".to_string(),
+			..Default::default()
 		};
 		let locations = vec!["./dir1".to_string(), "./dir2".to_string()];
 		let state = AppState::new(config, locations);
@@ -352,6 +356,7 @@ mod tests {
 		let config = Config {
 			syncr_dir: std::path::PathBuf::from("/tmp/.syncr"),
 			profile: "test".to_string(),
+			..Default::default()
 		};
 		let mut state = AppState::new(config, vec![]);
 
@@ -365,6 +370,7 @@ mod tests {
 		let config = Config {
 			syncr_dir: std::path::PathBuf::from("/tmp/.syncr"),
 			profile: "test".to_string(),
+			..Default::default()
 		};
 		let mut state = AppState::new(config, vec![]);
 		state.change_view(ViewType::Sync);

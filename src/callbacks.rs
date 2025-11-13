@@ -42,6 +42,19 @@ pub struct ProgressStats {
 	pub eta: Duration,
 }
 
+/// Cache statistics
+#[derive(Debug, Clone)]
+pub struct CacheStats {
+	/// Number of cached file entries
+	pub entries: usize,
+
+	/// Total cache database size in bytes
+	pub database_size_bytes: u64,
+
+	/// Number of active sync locks
+	pub active_locks: usize,
+}
+
 /// Callback for progress updates
 pub trait ProgressCallback: Send + Sync {
 	/// Called periodically with progress statistics

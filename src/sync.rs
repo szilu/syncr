@@ -1,7 +1,9 @@
 //! Synchronization API - high-level and mid-level interfaces
 
-use crate::config::{ConflictResolution, SyncConfig, SyncOptions};
+use crate::chunking::SyncOptions;
+use crate::config::Config;
 use crate::error::SyncError;
+use crate::strategies::ConflictResolution;
 use crate::types::SyncResult;
 use std::path::PathBuf;
 
@@ -38,16 +40,36 @@ pub async fn sync(
 	}
 }
 
+/// Cache statistics
+#[derive(Debug, Clone)]
+pub struct CacheStats {
+	/// Number of cache entries
+	pub entries: usize,
+	/// Database size in bytes
+	pub database_size_bytes: u64,
+	/// Number of active locks
+	pub active_locks: usize,
+}
+
+/// No-op callback for internal sync operations
+struct NoOpCallback;
+
+impl crate::sync_impl::SyncProgressCallback for NoOpCallback {
+	fn on_event(&self, _event: crate::sync_impl::SyncCallbackEvent) {
+		// Do nothing - this is used when SyncBuilder doesn't have registered callbacks
+	}
+}
+
 /// Builder for flexible sync configuration
 pub struct SyncBuilder {
 	locations: Vec<String>,
-	config: SyncConfig,
+	config: Config,
 }
 
 impl SyncBuilder {
 	/// Create a new sync builder with default settings
 	pub fn new() -> Self {
-		SyncBuilder { locations: Vec::new(), config: SyncConfig::default() }
+		SyncBuilder { locations: Vec::new(), config: Config::default() }
 	}
 
 	/// Add a local directory to sync
@@ -100,13 +122,13 @@ impl SyncBuilder {
 
 	/// Set chunk size (in bits, default: 20 = ~1MB avg)
 	pub fn chunk_size_bits(mut self, bits: u32) -> Self {
-		self.config.chunk_config.chunk_bits = bits;
+		self.config.chunk_bits = bits;
 		self
 	}
 
 	/// Set custom state directory (default: ~/.syncr)
 	pub fn state_dir(mut self, path: &str) -> Self {
-		self.config.state_dir = PathBuf::from(path);
+		self.config.syncr_dir = PathBuf::from(path);
 		self
 	}
 
@@ -127,60 +149,259 @@ impl SyncBuilder {
 	}
 
 	/// Get a reference to the sync configuration
-	pub fn config(&self) -> &SyncConfig {
+	pub fn config(&self) -> &Config {
 		&self.config
+	}
+
+	/// Get the profile name
+	pub fn profile_name(&self) -> &str {
+		&self.config.profile
+	}
+
+	/// Get the state directory
+	pub fn state_directory(&self) -> &std::path::Path {
+		&self.config.syncr_dir
+	}
+
+	/// Get the path to the state file for this profile
+	pub fn state_path(&self) -> std::path::PathBuf {
+		self.config.syncr_dir.join(format!("{}.profile.json", self.config.profile))
+	}
+
+	/// List all profiles in a state directory
+	pub async fn list_profiles(state_dir: &std::path::Path) -> Result<Vec<String>, SyncError> {
+		use tokio::fs;
+
+		if !state_dir.exists() {
+			return Ok(Vec::new());
+		}
+
+		let mut profiles = Vec::new();
+		let mut entries = fs::read_dir(state_dir).await.map_err(|e| SyncError::Other {
+			message: format!("Failed to read state directory: {}", e),
+		})?;
+
+		while let Some(entry) = entries.next_entry().await.map_err(|e| SyncError::Other {
+			message: format!("Failed to read directory entry: {}", e),
+		})? {
+			let filename = entry.file_name();
+			if let Some(name) = filename.to_str() {
+				if name.ends_with(".profile.json") {
+					let profile_name = name.trim_end_matches(".profile.json").to_string();
+					profiles.push(profile_name);
+				}
+			}
+		}
+
+		profiles.sort();
+		Ok(profiles)
+	}
+
+	/// Check if a profile exists in a state directory
+	pub async fn profile_exists(state_dir: &std::path::Path, profile: &str) -> bool {
+		let profile_path = state_dir.join(format!("{}.profile.json", profile));
+		profile_path.exists()
+	}
+
+	/// Delete a profile from a state directory
+	pub async fn delete_profile(
+		state_dir: &std::path::Path,
+		profile: &str,
+	) -> Result<(), SyncError> {
+		use tokio::fs;
+
+		let profile_path = state_dir.join(format!("{}.profile.json", profile));
+
+		if profile_path.exists() {
+			fs::remove_file(&profile_path).await.map_err(|e| SyncError::Other {
+				message: format!("Failed to delete profile: {}", e),
+			})?;
+		}
+
+		Ok(())
+	}
+
+	/// Load previously saved state for this profile
+	pub async fn load_state(&self) -> Result<Option<crate::types::PreviousSyncState>, SyncError> {
+		use serde::{Deserialize, Serialize};
+		use std::collections::BTreeMap;
+		use tokio::fs;
+
+		#[derive(Serialize, Deserialize)]
+		struct StateWrapper {
+			#[serde(default)]
+			files: BTreeMap<String, crate::types::FileData>,
+			#[serde(default)]
+			timestamp: u64,
+		}
+
+		let state_file =
+			self.config.syncr_dir.join(format!("{}.profile.json", self.config.profile));
+
+		// If file doesn't exist, this is the first sync
+		if !state_file.exists() {
+			return Ok(None);
+		}
+
+		// Try to read and parse the state
+		let contents = fs::read_to_string(&state_file).await.map_err(|e| SyncError::Other {
+			message: format!("Failed to read state file: {}", e),
+		})?;
+
+		let wrapper: StateWrapper = json5::from_str(&contents).map_err(|e| SyncError::Other {
+			message: format!("Failed to parse state file: {}", e),
+		})?;
+
+		Ok(Some(crate::types::PreviousSyncState {
+			files: wrapper.files,
+			timestamp: wrapper.timestamp,
+		}))
+	}
+
+	/// Save state for this profile
+	pub async fn save_state(
+		&self,
+		state: &crate::types::PreviousSyncState,
+	) -> Result<(), SyncError> {
+		use serde::Serialize;
+		use tokio::fs;
+
+		#[derive(Serialize)]
+		struct StateWrapper {
+			files: std::collections::BTreeMap<String, crate::types::FileData>,
+			timestamp: u64,
+		}
+
+		// Ensure state directory exists
+		fs::create_dir_all(&self.config.syncr_dir).await.map_err(|e| SyncError::Other {
+			message: format!("Failed to create state directory: {}", e),
+		})?;
+
+		let state_file =
+			self.config.syncr_dir.join(format!("{}.profile.json", self.config.profile));
+
+		let wrapper = StateWrapper { files: state.files.clone(), timestamp: state.timestamp };
+
+		let json = serde_json::to_string_pretty(&wrapper).map_err(|e| SyncError::Other {
+			message: format!("Failed to serialize state: {}", e),
+		})?;
+
+		fs::write(&state_file, json).await.map_err(|e| SyncError::Other {
+			message: format!("Failed to write state file: {}", e),
+		})?;
+
+		Ok(())
+	}
+
+	/// Clear saved state for this profile
+	pub async fn clear_state(&self) -> Result<(), SyncError> {
+		use tokio::fs;
+
+		let state_file =
+			self.config.syncr_dir.join(format!("{}.profile.json", self.config.profile));
+
+		if state_file.exists() {
+			fs::remove_file(&state_file).await.map_err(|e| SyncError::Other {
+				message: format!("Failed to delete state file: {}", e),
+			})?;
+		}
+
+		Ok(())
+	}
+
+	/// Clear the sync cache
+	pub async fn clear_cache(&self) -> Result<(), SyncError> {
+		use tokio::fs;
+
+		let cache_db_path = self.config.syncr_dir.join("cache.db");
+
+		if cache_db_path.exists() {
+			fs::remove_file(&cache_db_path).await.map_err(|e| SyncError::Other {
+				message: format!("Failed to delete cache file: {}", e),
+			})?;
+		}
+
+		Ok(())
+	}
+
+	/// Get cache statistics
+	pub async fn cache_stats(&self) -> Result<CacheStats, SyncError> {
+		use tokio::fs;
+
+		let cache_db_path = self.config.syncr_dir.join("cache.db");
+
+		let database_size_bytes = if cache_db_path.exists() {
+			fs::metadata(&cache_db_path).await.map(|m| m.len()).unwrap_or(0)
+		} else {
+			0
+		};
+
+		// For now, return basic stats
+		// In a real implementation, this would query the cache database
+		Ok(CacheStats { entries: 0, database_size_bytes, active_locks: 0 })
+	}
+
+	/// Cleanup stale locks
+	pub async fn cleanup_stale_locks(&self) -> Result<usize, SyncError> {
+		// For now, return 0 (no stale locks cleaned)
+		// In a real implementation, this would check for and clean stale locks
+		Ok(0)
 	}
 
 	/// Execute the sync operation
 	pub async fn sync(self) -> Result<SyncResult, SyncError> {
+		use std::path::Path;
+
 		if self.locations.is_empty() {
 			return Err(SyncError::InvalidConfig {
 				message: "At least one location is required".to_string(),
 			});
 		}
 
-		// Convert locations to &str for connection
-		let locations: Vec<&str> = self.locations.iter().map(|s| s.as_str()).collect();
+		// Validate that local directories exist (only for absolute paths)
+		for location in &self.locations {
+			// Skip remote locations (those containing ':' and not starting with '/', '.', or '~')
+			if location.contains(':')
+				&& !location.starts_with('/')
+				&& !location.starts_with('.')
+				&& !location.starts_with('~')
+			{
+				// Remote location, skip validation
+				continue;
+			}
 
-		// Create and execute sync session
-		let mut session = phases::SyncSession::new(locations).await.map_err(|e| {
-			SyncError::Other { message: format!("Failed to initialize sync: {}", e) }
-		})?;
+			let path = Path::new(location);
 
-		// Run through all phases
-		session
-			.collect()
-			.await
-			.map_err(|e| SyncError::Other { message: format!("Collection failed: {}", e) })?;
+			// Only validate absolute paths (starting with '/')
+			// Relative paths will be validated later when connecting
+			if path.is_absolute() && !path.starts_with("~") {
+				if !path.exists() {
+					return Err(SyncError::InvalidConfig {
+						message: format!("Directory does not exist: {}", location),
+					});
+				}
 
-		// Detect conflicts
-		let conflicts = session.detect_conflicts().await.map_err(|e| SyncError::Other {
-			message: format!("Conflict detection failed: {}", e),
-		})?;
-
-		// Resolve conflicts based on strategy
-		if !conflicts.is_empty() {
-			session.resolve_all_conflicts(self.config.conflict_resolution.clone()).map_err(
-				|e| SyncError::Other { message: format!("Conflict resolution failed: {}", e) },
-			)?;
+				if !path.is_dir() {
+					return Err(SyncError::InvalidConfig {
+						message: format!("Path is not a directory: {}", location),
+					});
+				}
+			}
 		}
 
-		// Transfer metadata
-		session.transfer_metadata().await.map_err(|e| SyncError::Other {
-			message: format!("Metadata transfer failed: {}", e),
-		})?;
+		// Use the SyncBuilder's config directly (it's already the unified Config)
+		let config = self.config.clone();
 
-		// Transfer chunks
-		session
-			.transfer_chunks()
-			.await
-			.map_err(|e| SyncError::Other { message: format!("Chunk transfer failed: {}", e) })?;
+		// Convert locations to &str for sync_impl
+		let locations: Vec<&str> = self.locations.iter().map(|s| s.as_str()).collect();
 
-		// Commit changes
-		session
-			.commit()
+		// Create a no-op callback (sync_impl will handle conflicts internally)
+		let callback = Box::new(NoOpCallback);
+
+		// Delegate to the working sync_impl implementation
+		crate::sync_impl::sync_with_callbacks(config, locations, callback, None)
 			.await
-			.map_err(|e| SyncError::Other { message: format!("Commit failed: {}", e) })
+			.map_err(|e| SyncError::Other { message: e.to_string() })
 	}
 }
 
@@ -190,202 +411,10 @@ impl Default for SyncBuilder {
 	}
 }
 
-/// Mid-level sync API with control over individual phases
-pub mod phases {
-	use crate::config::ConflictResolution;
-	use crate::connection;
-	use crate::error::SyncError;
-	use crate::types::SyncResult;
-
-	/// Represents an active sync session with control over individual phases
-	pub struct SyncSession {
-		#[allow(dead_code)]
-		nodes: Vec<connection::Node>,
-		collected: bool,
-		#[allow(dead_code)]
-		conflicts_detected: Vec<ConflictInfo>,
-	}
-
-	#[derive(Debug, Clone)]
-	struct ConflictInfo {
-		#[allow(dead_code)]
-		path: String,
-	}
-
-	impl SyncSession {
-		/// Create a new sync session
-		pub async fn new(locations: Vec<&str>) -> Result<Self, SyncError> {
-			if locations.is_empty() {
-				return Err(SyncError::InvalidConfig {
-					message: "At least one location required".to_string(),
-				});
-			}
-
-			// Connect to all nodes in parallel
-			let mut nodes =
-				connection::connect_all(locations).await.map_err(SyncError::Connection)?;
-
-			// Perform handshake with each node
-			for node in &mut nodes {
-				Self::handshake(node).await.map_err(|e| SyncError::Other {
-					message: format!("Handshake failed: {}", e),
-				})?;
-			}
-
-			Ok(SyncSession { nodes, collected: false, conflicts_detected: Vec::new() })
-		}
-
-		async fn handshake(node: &mut connection::Node) -> Result<(), Box<dyn std::error::Error>> {
-			use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-
-			// Read ready signal
-			let mut buf = String::new();
-			node.stdout().read_line(&mut buf).await?;
-			if buf.trim() != "." {
-				return Err("Expected ready signal from server".into());
-			}
-
-			// Send protocol version
-			node.stdin().write_all(b"VERSION:1\n").await?;
-
-			// Read server version
-			buf.clear();
-			node.stdout().read_line(&mut buf).await?;
-
-			if !buf.starts_with("VERSION:") {
-				return Err("Invalid handshake response".into());
-			}
-
-			Ok(())
-		}
-
-		/// Phase 1: Collect file metadata and chunks from all locations
-		pub async fn collect(&mut self) -> Result<CollectionStats, SyncError> {
-			// Basic implementation: just mark as collected
-			// In a full implementation, this would:
-			// 1. Send LIST command to each node
-			// 2. Parse responses
-			// 3. Build a map of files and chunks
-			self.collected = true;
-
-			Ok(CollectionStats { files_found: 0, total_size: 0, chunks_created: 0 })
-		}
-
-		/// Phase 2: Detect conflicts across all locations
-		pub async fn detect_conflicts(&self) -> Result<Vec<crate::conflict::Conflict>, SyncError> {
-			// In a full implementation, this would compare file metadata across nodes
-			// For now, return empty (no conflicts detected)
-			Ok(Vec::new())
-		}
-
-		/// Resolve a specific conflict by choosing a winner
-		pub fn resolve_conflict(
-			&mut self,
-			_conflict_id: u64,
-			_winner_index: usize,
-		) -> Result<(), SyncError> {
-			Ok(())
-		}
-
-		/// Batch resolve conflicts using a strategy
-		pub fn resolve_all_conflicts(
-			&mut self,
-			_strategy: ConflictResolution,
-		) -> Result<(), SyncError> {
-			// In a full implementation, this would apply the conflict resolution strategy
-			// to all detected conflicts
-			Ok(())
-		}
-
-		/// Phase 3: Transfer file/directory metadata to nodes
-		pub async fn transfer_metadata(&mut self) -> Result<MetadataStats, SyncError> {
-			// In a full implementation, this would:
-			// 1. Send WRITE commands to nodes that need file/directory creation
-			// 2. Track statistics
-			Ok(MetadataStats { files_to_create: 0, files_to_delete: 0, dirs_to_create: 0 })
-		}
-
-		/// Phase 4: Transfer missing chunks between nodes
-		pub async fn transfer_chunks(&mut self) -> Result<ChunkStats, SyncError> {
-			// In a full implementation, this would:
-			// 1. Identify missing chunks on each node
-			// 2. Transfer them from nodes that have them
-			// 3. Track statistics
-			Ok(ChunkStats { chunks_transferred: 0, chunks_deduplicated: 0, bytes_transferred: 0 })
-		}
-
-		/// Phase 5: Commit all changes (rename temp files to final)
-		pub async fn commit(self) -> Result<SyncResult, SyncError> {
-			// In a full implementation, this would:
-			// 1. Send COMMIT command to each node
-			// 2. Verify all commits succeeded
-			// 3. Return final statistics
-
-			Ok(SyncResult {
-				files_synced: 0,
-				dirs_created: 0,
-				files_deleted: 0,
-				bytes_transferred: 0,
-				chunks_transferred: 0,
-				chunks_deduplicated: 0,
-				conflicts_encountered: 0,
-				conflicts_resolved: 0,
-				duration: std::time::Duration::from_secs(0),
-				errors: Vec::new(),
-			})
-		}
-
-		/// Abort the sync session (cleanup temp files)
-		pub async fn abort(self) -> Result<(), SyncError> {
-			// In a full implementation, this would send cleanup commands to nodes
-			Ok(())
-		}
-	}
-
-	/// Statistics from collection phase
-	#[derive(Debug, Clone)]
-	pub struct CollectionStats {
-		/// Number of files found
-		pub files_found: usize,
-
-		/// Total size of files
-		pub total_size: u64,
-
-		/// Number of chunks created
-		pub chunks_created: usize,
-	}
-
-	/// Statistics from metadata transfer phase
-	#[derive(Debug, Clone)]
-	pub struct MetadataStats {
-		/// Number of files to create
-		pub files_to_create: usize,
-
-		/// Number of files to delete
-		pub files_to_delete: usize,
-
-		/// Number of directories to create
-		pub dirs_to_create: usize,
-	}
-
-	/// Statistics from chunk transfer phase
-	#[derive(Debug, Clone)]
-	pub struct ChunkStats {
-		/// Number of chunks transferred
-		pub chunks_transferred: usize,
-
-		/// Number of chunks deduplicated
-		pub chunks_deduplicated: usize,
-
-		/// Total bytes transferred
-		pub bytes_transferred: u64,
-	}
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::config::ConflictResolution;
+	use crate::strategies::ConflictResolution;
 
 	#[test]
 	fn test_builder_creation() {
@@ -454,7 +483,7 @@ mod tests {
 	#[test]
 	fn test_builder_chunk_size() {
 		let builder = SyncBuilder::new().chunk_size_bits(21);
-		assert_eq!(builder.config.chunk_config.chunk_bits, 21);
+		assert_eq!(builder.config.chunk_bits, 21);
 	}
 }
 

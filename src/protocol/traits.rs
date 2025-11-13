@@ -1,7 +1,15 @@
-//! Core protocol trait defining the sync communication interface
+//! Core protocol traits defining the sync communication interface
 //!
 //! All protocol implementations (V2, V3, future versions) must implement
-//! this trait to provide the sync engine with protocol operations.
+//! these traits to provide the sync engine with protocol operations.
+//!
+//! # Architecture
+//!
+//! We use two complementary traits:
+//! - `ProtocolClient`: Used by sync orchestrator to communicate with a remote/local node
+//! - `ProtocolServer`: Implemented by nodes to handle incoming protocol requests
+//!
+//! Both are implemented by protocol-specific types (e.g., V3Client, V3Server).
 
 use async_trait::async_trait;
 use std::path::Path;
@@ -12,17 +20,22 @@ use super::types::*;
 /// Result type for protocol operations
 pub type ProtocolResult<T> = Result<T, ProtocolError>;
 
-/// Core trait defining all protocol operations for sync communication
+/// Client-side protocol interface used by sync orchestrator
 ///
-/// This trait abstracts all protocol-specific details and provides a unified
-/// interface that the sync engine can use regardless of protocol version.
-/// The sync logic depends only on this trait, never on specific protocol versions.
+/// This trait abstracts all protocol-specific details on the client side
+/// and provides a unified interface that the sync engine can use regardless
+/// of protocol version or transport (local channels vs remote JSON5).
+///
+/// Implementations: ProtocolV3Client (JSON5/pipes), ProtocolInternalClient (channels)
 #[async_trait]
-pub trait SyncProtocol: Send + Sync {
+pub trait ProtocolClient: Send + Sync {
 	// === Metadata ===
 
-	/// Get protocol version identifier
-	fn version(&self) -> ProtocolVersion;
+	/// Get protocol implementation identifier
+	fn protocol_name(&self) -> &str;
+
+	/// Request node capabilities (supported metadata operations)
+	async fn request_capabilities(&mut self) -> ProtocolResult<super::types::NodeCapabilities>;
 
 	// === Lifecycle ===
 
@@ -31,7 +44,7 @@ pub trait SyncProtocol: Send + Sync {
 
 	// === Collection Phase (LIST) ===
 
-	/// Request directory listing from remote node
+	/// Request directory listing from node
 	async fn request_listing(&mut self) -> ProtocolResult<()>;
 
 	/// Receive and parse the next entry in directory listing
@@ -43,7 +56,7 @@ pub trait SyncProtocol: Send + Sync {
 	/// Enter WRITE mode for sending file metadata
 	async fn begin_metadata_transfer(&mut self) -> ProtocolResult<()>;
 
-	/// Send file/directory/symlink metadata to remote
+	/// Send file/directory/symlink metadata to node
 	async fn send_metadata(&mut self, entry: &MetadataEntry) -> ProtocolResult<()>;
 
 	/// Send file deletion command
@@ -57,14 +70,14 @@ pub trait SyncProtocol: Send + Sync {
 	/// Enter READ mode for chunk transfer
 	async fn begin_chunk_transfer(&mut self) -> ProtocolResult<()>;
 
-	/// Request specific chunks from remote
+	/// Request specific chunks from node
 	async fn request_chunks(&mut self, chunk_hashes: &[String]) -> ProtocolResult<()>;
 
-	/// Receive next chunk from remote
+	/// Receive next chunk from node
 	/// Returns None when all requested chunks received
 	async fn receive_chunk(&mut self) -> ProtocolResult<Option<ChunkData>>;
 
-	/// Send chunk data to remote
+	/// Send chunk data to node
 	async fn send_chunk(&mut self, hash: &str, data: &[u8]) -> ProtocolResult<()>;
 
 	/// Exit READ mode
@@ -77,7 +90,7 @@ pub trait SyncProtocol: Send + Sync {
 
 	// === Utility Methods ===
 
-	/// Check if a chunk is available locally
+	/// Check if a chunk is available locally (on the client/orchestrator side)
 	fn has_chunk(&self, hash: &[u8; 32]) -> bool;
 
 	/// Mark chunks as missing (need transfer)
@@ -93,14 +106,64 @@ pub trait SyncProtocol: Send + Sync {
 	fn clear_missing_chunks(&self);
 }
 
+/// Server-side protocol handler
+///
+/// This trait defines the business logic operations that nodes must implement.
+/// The actual I/O (channels vs JSON5) is handled by protocol-specific implementations.
+///
+/// Implementations: ProtocolV3Server (JSON5/pipes), ProtocolInternalServer (channels)
+///
+/// Note: ProtocolServer doesn't require Send or Sync because servers are
+/// always run in a single task and don't need to be shared across threads.
+/// The DumpState struct uses RefCell which isn't Send/Sync, so we can't require them.
+/// We use #[async_trait(?Send)] to allow non-Send futures.
+#[async_trait(?Send)]
+pub trait ProtocolServer {
+	/// Get base directory being served
+	#[allow(dead_code)]
+	fn base_path(&self) -> &Path;
+
+	/// Handle capabilities request
+	async fn handle_capabilities(&mut self) -> ProtocolResult<NodeCapabilities>;
+
+	/// Handle listing request - returns all entries
+	async fn handle_list(&mut self) -> ProtocolResult<Vec<FileSystemEntry>>;
+
+	/// Handle metadata write - processes incoming metadata entry
+	async fn handle_write_metadata(&mut self, entry: &MetadataEntry) -> ProtocolResult<()>;
+
+	/// Handle file deletion
+	async fn handle_delete(&mut self, path: &Path) -> ProtocolResult<()>;
+
+	/// Handle chunk read request - returns requested chunks
+	async fn handle_read_chunks(&mut self, hashes: &[String]) -> ProtocolResult<Vec<ChunkData>>;
+
+	/// Handle incoming chunk data
+	async fn handle_write_chunk(&mut self, hash: &str, data: &[u8]) -> ProtocolResult<()>;
+
+	/// Handle commit - rename temp files to final locations
+	async fn handle_commit(&mut self) -> ProtocolResult<CommitResponse>;
+
+	/// Check if a chunk is available
+	#[allow(dead_code)]
+	fn has_chunk(&self, hash: &[u8; 32]) -> bool;
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
 
 	#[test]
-	fn test_protocol_version_values() {
-		let v3 = ProtocolVersion::V3;
-		assert_eq!(v3, ProtocolVersion::V3);
+	fn test_protocol_client_trait_exists() {
+		// This test verifies the trait is properly defined
+		// Actual tests of implementations are in their respective modules
+		let _: &dyn ProtocolClient;
+	}
+
+	#[test]
+	fn test_protocol_server_trait_exists() {
+		// This test verifies the trait is properly defined
+		let _: &dyn ProtocolServer;
 	}
 }
 

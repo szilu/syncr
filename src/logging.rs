@@ -15,7 +15,7 @@
 //! trace!("Detailed trace information");
 //! ```
 
-pub use tracing::{debug, error, info, warn};
+pub use tracing::{debug, info, warn};
 
 #[cfg(feature = "tui")]
 use tokio::sync::broadcast;
@@ -42,6 +42,7 @@ pub fn init_tracing() {
 
 /// Wrapper for stdout that silently ignores broken pipe errors
 /// This prevents child processes from panicking when parent closes the pipe
+#[allow(dead_code)]
 struct ResilientStdout;
 
 impl std::io::Write for ResilientStdout {
@@ -71,6 +72,7 @@ impl std::io::Write for ResilientStdout {
 /// Initialize tracing subscriber that propagates messages via protocol
 /// Used by child processes (serve.rs) to send all logs through stdout
 /// Messages are formatted as: #<LEVEL>:<message> or !E:<message> for errors
+#[allow(dead_code)]
 pub fn init_protocol_propagation() {
 	use tracing_subscriber::fmt::format::FormatFields;
 

@@ -12,12 +12,17 @@ use tokio::sync::Mutex;
 
 // Use the old connect module directly (not the new connection.rs library API)
 use crate::cache::ChildCache;
+use crate::config::Config;
+use crate::conflict::{Conflict, ConflictResolver, ConflictType, FileVersion};
 use crate::connect;
+use crate::exclusion::{ExcludeConfig, ExclusionEngine};
 use crate::logging::*;
 #[allow(unused_imports)]
 use crate::metadata_utils;
-use crate::types::{Config, FileData, PreviousSyncState, SyncPhase};
-use crate::utils::{setup_signal_handlers, TerminalGuard};
+use crate::types::{FileData, PreviousSyncState, SyncPhase};
+use crate::utils::setup_signal_handlers;
+use crate::utils::terminal::{restore_terminal_state, TerminalGuard};
+use tracing::error;
 
 //////////
 // Callbacks trait for sync progress notification //
@@ -55,6 +60,11 @@ pub enum SyncCallbackEvent {
 	NodeReady {
 		node_id: usize,
 		location: String,
+	},
+
+	/// Protocol version selected during negotiation
+	ProtocolVersionSelected {
+		version: u32,
 	},
 
 	NodeDisconnecting {
@@ -132,13 +142,14 @@ struct SyncState {
 }
 
 impl SyncState {
-	fn add_node(&mut self, protocol: Box<dyn crate::protocol::SyncProtocol>) {
+	fn add_node(&mut self, protocol: Box<dyn crate::protocol::ProtocolClient>) {
 		let node = NodeState {
 			id: self.nodes.len() as u8 + 1,
 			protocol: Mutex::new(protocol),
 			dir: BTreeMap::new(),
 			chunks: BTreeSet::new(),
 			missing: Mutex::new(BTreeSet::new()),
+			capabilities: None,
 		};
 		self.nodes.push(node);
 	}
@@ -446,6 +457,19 @@ async fn run_sync_logic(
 	}
 
 	info!("Initializing processes...");
+
+	// ─── PHASE 1: Connection & Capability Collection ───
+	// We need to handle both local (in-process) and remote (subprocess) connections
+	enum ProtocolState {
+		// Remote connection waiting for version decision
+		Remote(usize, crate::protocol::factory::ProtocolV3Waiting),
+		// Local connection ready immediately (uses in-process protocol)
+		Local(usize, Box<dyn crate::protocol::ProtocolClient>),
+	}
+
+	let mut protocol_states: Vec<ProtocolState> = Vec::new();
+	let mut connection_capabilities: Vec<Vec<u32>> = Vec::new();
+
 	for (idx, dir) in dirs.iter().enumerate() {
 		// Notify that we're connecting
 		if let Some(ref cb) = callbacks {
@@ -457,17 +481,96 @@ async fn run_sync_logic(
 
 		let conn = connect::connect(dir).await?;
 
-		// Perform protocol negotiation and handshake
-		info!("Negotiating protocol with {}...", dir);
-		let protocol = crate::protocol::negotiate_protocol(conn.send, conn.recv).await?;
+		// Handle connection based on type
+		match conn {
+			connect::ConnectionType::Local(path) => {
+				info!("Creating in-process protocol for local path: {}", path.display());
+				// For local paths, create in-process protocol
+				// Build exclusion patterns: always exclude .SyNcR-TmP, plus configured patterns
+				let mut exclude_patterns = vec!["**/*.SyNcR-TmP".to_string()];
+				exclude_patterns.extend(config.exclude_patterns.clone());
 
-		// Notify that node is ready
-		if let Some(ref cb) = callbacks {
-			cb.on_event(SyncCallbackEvent::NodeReady { node_id: idx, location: dir.to_string() });
+				let exclude_glob_patterns: Vec<_> = exclude_patterns
+					.iter()
+					.filter_map(|pattern| glob::Pattern::new(pattern).ok())
+					.collect();
+
+				let dump_state = crate::serve::DumpState {
+					exclude: exclude_glob_patterns,
+					chunks: Default::default(),
+					missing: std::sync::Arc::new(Mutex::new(Default::default())),
+					rename: std::sync::Arc::new(Mutex::new(Default::default())),
+					chunk_writes: std::sync::Arc::new(Mutex::new(Default::default())),
+					cache: None,
+				};
+
+				let protocol = crate::protocol::create_local_protocol(path, dump_state).await?;
+
+				// Local protocols support the same versions as the current binary
+				let server_caps = crate::protocol::negotiation::SUPPORTED_VERSIONS.to_vec();
+				connection_capabilities.push(server_caps.clone());
+				protocol_states.push(ProtocolState::Local(idx, protocol));
+
+				info!(
+					"Node {} (local) capabilities: {:?}",
+					idx,
+					crate::protocol::negotiation::SUPPORTED_VERSIONS
+				);
+			}
+			connect::ConnectionType::Remote { send, recv } => {
+				// Perform protocol handshake and capabilities exchange for remote connections
+				info!("Negotiating protocol with {}...", dir);
+				let waiting = crate::protocol::create_remote_protocol(send, recv).await?;
+				let server_caps = waiting.server_capabilities().to_vec();
+
+				connection_capabilities.push(server_caps.clone());
+				protocol_states.push(ProtocolState::Remote(idx, waiting));
+
+				info!("Node {} (remote) capabilities: {:?}", idx, server_caps);
+			}
 		}
-
-		state.add_node(protocol);
 	}
+
+	// ─── PHASE 2: Version Decision ───
+	let common_version = crate::protocol::factory::find_common_version(&connection_capabilities)?;
+	info!("Selected common protocol version: {}", common_version);
+
+	if let Some(ref cb) = callbacks {
+		cb.on_event(SyncCallbackEvent::ProtocolVersionSelected { version: common_version });
+	}
+
+	// ─── PHASE 3: Version Distribution & Protocol Finalization ───
+	for protocol_state in protocol_states.into_iter() {
+		match protocol_state {
+			ProtocolState::Remote(idx, waiting) => {
+				// Remote connections need to finalize the version decision
+				let protocol = waiting.finalize(common_version).await?;
+				state.add_node(protocol);
+
+				// Notify that node is ready
+				if let Some(ref cb) = callbacks {
+					cb.on_event(SyncCallbackEvent::NodeReady {
+						node_id: idx,
+						location: dirs[idx].to_string(),
+					});
+				}
+			}
+			ProtocolState::Local(idx, protocol) => {
+				// Local connections are ready immediately
+				state.add_node(protocol);
+
+				// Notify that node is ready
+				if let Some(ref cb) = callbacks {
+					cb.on_event(SyncCallbackEvent::NodeReady {
+						node_id: idx,
+						location: dirs[idx].to_string(),
+					});
+				}
+			}
+		}
+	}
+
+	info!("All nodes ready with protocol version {}", common_version);
 
 	// Notify callbacks that we're collecting
 	if let Some(ref cb) = callbacks {
@@ -548,6 +651,37 @@ async fn run_sync_logic(
 	// Wait for all collections to complete
 	try_join_all(collection_tasks).await?;
 
+	// Apply exclusion filters to collected files (especially from remote nodes)
+	info!("Applying exclusion filters...");
+	let exclude_config =
+		ExcludeConfig { patterns: config.exclude_patterns.clone(), ..Default::default() };
+
+	// Create exclusion engine for filtering (using root path for now)
+	let exclusion_engine = match ExclusionEngine::new_with_includes(
+		&exclude_config,
+		std::path::Path::new("/"),
+		&config.include_patterns,
+	) {
+		Ok(engine) => Some(engine),
+		Err(e) => {
+			warn!("Failed to create exclusion engine: {}. Proceeding without filtering.", e);
+			None
+		}
+	};
+
+	// Filter files in each node's dir
+	if let Some(ref engine) = exclusion_engine {
+		for node in state.nodes.iter_mut() {
+			let initial_count = node.dir.len();
+			node.dir.retain(|path, _| !engine.should_exclude(path, None));
+			let final_count = node.dir.len();
+			let excluded = initial_count - final_count;
+			if excluded > 0 {
+				info!("Node: excluded {} files based on patterns", excluded);
+			}
+		}
+	}
+
 	// Signal collection phase complete
 	if let Some(ref cb) = callbacks {
 		cb.on_event(SyncCallbackEvent::PhaseChanged {
@@ -597,8 +731,20 @@ async fn run_sync_logic(
 	// This will be None if stdin is not a terminal (e.g., piped input)
 	// NOTE: In TUI mode (when callbacks present), disable interactive terminal mode
 	// and let the TUI handle conflict resolution instead
-	let _terminal_guard = TerminalGuard::new();
+	// Also skip during tests/CI to avoid terminal corruption
+	let skip_terminal_mode = cfg!(test) || std::env::var("SYNCR_SKIP_TERMINAL").is_ok();
+	let _terminal_guard = if skip_terminal_mode { None } else { TerminalGuard::new() };
 	let interactive_mode = _terminal_guard.is_some() && callbacks.is_none();
+
+	// Setup panic hook to ensure terminal is always restored even on panic
+	if _terminal_guard.is_some() {
+		let default_hook = std::panic::take_hook();
+		std::panic::set_hook(Box::new(move |panic_info| {
+			// Attempt to restore terminal before printing panic
+			restore_terminal_state();
+			default_hook(panic_info);
+		}));
+	}
 
 	// Track conflicts for async resolution (TUI mode)
 	// Use RefCell to allow interior mutability in closures
@@ -772,9 +918,69 @@ async fn run_sync_logic(
 							}
 						}
 					} else {
-						// Non-interactive mode: skip conflicts by default
-						warn!("(non-interactive mode: skipping conflict)");
-						winner = SyncOption::None;
+						// Non-interactive mode: apply configured conflict resolution strategy
+
+						// Build FileVersion vector for the Conflict
+						let mut versions = Vec::new();
+						for (idx, file_opt) in original_files.iter().enumerate() {
+							if let Some(f) = file_opt {
+								let node_location = state.nodes.get(idx)
+									.map(|n| format!("node_{}", n.id))
+									.unwrap_or_else(|| format!("node_{}", idx));
+								versions.push(FileVersion {
+									node_index: idx,
+									node_location,
+									file_data: f.as_ref().clone(),
+								});
+							}
+						}
+
+						if versions.is_empty() {
+							warn!("No valid file versions for conflict at {}", path.display());
+							winner = SyncOption::None;
+						} else {
+							// Create Conflict object
+							let conflict = Conflict::new(
+								metrics.conflicts_encountered as u64,
+								path.to_path_buf(),
+								ConflictType::ModifyModify,
+								versions,
+							);
+
+							// Create resolver with default strategy
+							let resolver = ConflictResolver::new(config.conflict_resolution.clone());
+
+							// Apply strategy
+							match resolver.resolve(&conflict, None) {
+								Ok(Some(winner_idx)) => {
+									winner = SyncOption::Some(winner_idx as u8);
+									info!(
+										"Conflict resolved using strategy {:?}: node {} wins for {}",
+										config.conflict_resolution,
+										winner_idx,
+										path.display()
+									);
+									metrics.conflicts_resolved += 1;
+								}
+								Ok(None) => {
+									// Skip strategy
+									winner = SyncOption::None;
+									info!(
+										"Conflict skipped (Skip strategy) for {}",
+										path.display()
+									);
+								}
+								Err(e) => {
+									warn!(
+										"Failed to resolve conflict for {} using strategy {:?}: {}. Skipping.",
+										path.display(),
+										config.conflict_resolution,
+										e
+									);
+									winner = SyncOption::None;
+								}
+							}
+						}
 					}
 				}
 				if let SyncOption::Some(win) = winner {
@@ -937,7 +1143,7 @@ async fn run_sync_logic(
 	let json =
 		json5::to_string(&tree).map_err(|e| format!("Failed to serialize state to JSON: {}", e))?;
 	debug!("JSON: {}", json);
-	let fname = config.syncr_dir.clone().join("test.profile.json");
+	let fname = config.syncr_dir.clone().join(format!("{}.profile.json", config.profile));
 	let mut f = afs::File::create(&fname).await?;
 	f.write_all(json.as_bytes()).await?;
 
@@ -995,7 +1201,9 @@ async fn run_sync_logic(
 					}
 					if trans_meta {
 						let node = &state.nodes[idx];
-						node.write_file(lfile, trans_data).await?;
+						if !config.dry_run {
+							node.write_file(lfile, trans_data).await?;
+						}
 					}
 				}
 			}
@@ -1032,14 +1240,16 @@ async fn run_sync_logic(
 			});
 		}
 
-		for node in &state.nodes {
-			let path = std::path::Path::new(deleted_path.as_str());
-			node.protocol
-				.lock()
-				.await
-				.send_delete(path)
-				.await
-				.map_err(|e| Box::new(e) as Box<dyn Error>)?;
+		if !config.dry_run {
+			for node in &state.nodes {
+				let path = std::path::Path::new(deleted_path.as_str());
+				node.protocol
+					.lock()
+					.await
+					.send_delete(path)
+					.await
+					.map_err(|e| Box::new(e) as Box<dyn Error>)?;
+			}
 		}
 
 		metrics.files_deleted += 1;
@@ -1097,17 +1307,22 @@ async fn run_sync_logic(
 	let mut chunk_sizes: std::collections::HashMap<String, usize> =
 		std::collections::HashMap::new();
 
+	// First pass: collect all missing chunks from all nodes
 	for node in &state.nodes {
 		let missing = node.missing.lock().await;
 		for chunk_hash in missing.iter() {
 			all_missing_chunks.insert(chunk_hash.clone());
 		}
+	}
 
-		// Build mapping of chunk hash to size from this node's files
+	// Second pass: build mapping of chunk hash to size from all nodes' files
+	// This must be separate from the first pass so that chunks are added to chunk_sizes
+	// even if their source node is processed before the destination node marks them as missing
+	for node in &state.nodes {
 		for file_data in node.dir.values() {
 			for chunk in &file_data.chunks {
 				let hash_b64 = crate::util::hash_to_base64(&chunk.hash);
-				if all_missing_chunks.contains(&hash_b64) || missing.contains(&hash_b64) {
+				if all_missing_chunks.contains(&hash_b64) {
 					chunk_sizes.insert(hash_b64, chunk.size as usize);
 				}
 			}
@@ -1138,20 +1353,38 @@ async fn run_sync_logic(
 
 	let mut done: BTreeSet<String> = BTreeSet::new();
 	for (src_idx, srcnode) in state.nodes.iter().enumerate() {
-		debug!("  - NODE {}", srcnode.id);
+		debug!("[CHUNK_TRANSFER] Processing node {}: {}", src_idx, srcnode.id);
 
 		// Collect all chunks to request from this source
 		let mut chunks_to_request = Vec::new();
 		for (dst_idx, dstnode) in state.nodes.iter().enumerate() {
 			if dst_idx != src_idx {
 				let missing = dstnode.missing.lock().await;
+				debug!("[CHUNK_TRANSFER] Node {} missing {} chunks", dstnode.id, missing.len());
 				for chunk_b64 in missing.iter() {
 					if !done.contains(chunk_b64) {
 						// Convert base64 hash to binary for chunks lookup
-						if let Ok(chunk_hash) = crate::util::base64_to_hash(chunk_b64) {
-							if srcnode.chunks.contains(&chunk_hash) {
-								chunks_to_request.push(chunk_b64.clone());
-								done.insert(chunk_b64.clone());
+						match crate::util::base64_to_hash(chunk_b64) {
+							Ok(chunk_hash) => {
+								if srcnode.chunks.contains(&chunk_hash) {
+									debug!(
+										"[CHUNK_TRANSFER] Source node {} has chunk {}, will request",
+										srcnode.id, chunk_b64
+									);
+									chunks_to_request.push(chunk_b64.clone());
+									done.insert(chunk_b64.clone());
+								} else {
+									debug!(
+										"[CHUNK_TRANSFER] Source node {} does NOT have chunk {}",
+										srcnode.id, chunk_b64
+									);
+								}
+							}
+							Err(e) => {
+								error!(
+									"[CHUNK_TRANSFER] Failed to convert base64 hash {}: {}",
+									chunk_b64, e
+								);
 							}
 						}
 					}
@@ -1159,61 +1392,102 @@ async fn run_sync_logic(
 			}
 		}
 
+		info!(
+			"[CHUNK_TRANSFER] Requesting {} chunks from node {} ({}) for transfer",
+			chunks_to_request.len(),
+			srcnode.id,
+			src_idx
+		);
+
+		if chunks_to_request.is_empty() {
+			debug!("[CHUNK_TRANSFER] No chunks to request from this source, skipping");
+			continue;
+		}
+
 		// Close WRITE session before entering READ mode
-		srcnode
-			.protocol
-			.lock()
-			.await
-			.end_metadata_transfer()
-			.await
-			.map_err(|e| Box::new(e) as Box<dyn Error>)?;
+		debug!("[CHUNK_TRANSFER] Ending metadata transfer for node {}", srcnode.id);
+		srcnode.protocol.lock().await.end_metadata_transfer().await.map_err(|e| {
+			error!(
+				"[CHUNK_TRANSFER] Failed to end metadata transfer for node {}: {}",
+				srcnode.id, e
+			);
+			Box::new(e) as Box<dyn Error>
+		})?;
 
 		// Begin chunk transfer and request chunks
-		srcnode
-			.protocol
-			.lock()
-			.await
-			.begin_chunk_transfer()
-			.await
-			.map_err(|e| Box::new(e) as Box<dyn Error>)?;
+		debug!("[CHUNK_TRANSFER] Beginning chunk transfer for node {}", srcnode.id);
+		srcnode.protocol.lock().await.begin_chunk_transfer().await.map_err(|e| {
+			error!(
+				"[CHUNK_TRANSFER] Failed to begin chunk transfer for node {}: {}",
+				srcnode.id, e
+			);
+			Box::new(e) as Box<dyn Error>
+		})?;
+
+		debug!(
+			"[CHUNK_TRANSFER] Requesting {} chunks from node {}",
+			chunks_to_request.len(),
+			srcnode.id
+		);
 		srcnode
 			.protocol
 			.lock()
 			.await
 			.request_chunks(&chunks_to_request)
 			.await
-			.map_err(|e| Box::new(e) as Box<dyn Error>)?;
+			.map_err(|e| {
+				error!("[CHUNK_TRANSFER] Failed to request chunks from node {}: {}", srcnode.id, e);
+				Box::new(e) as Box<dyn Error>
+			})?;
 
 		// Receive chunks
+		debug!("[CHUNK_TRANSFER] Starting to receive chunks from node {}", srcnode.id);
+		let mut chunks_received = 0;
 		loop {
-			let chunk_opt = srcnode
-				.protocol
-				.lock()
-				.await
-				.receive_chunk()
-				.await
-				.map_err(|e| Box::new(e) as Box<dyn Error>)?;
+			let chunk_opt = srcnode.protocol.lock().await.receive_chunk().await.map_err(|e| {
+				error!("[CHUNK_TRANSFER] Failed to receive chunk from node {}: {}", srcnode.id, e);
+				Box::new(e) as Box<dyn Error>
+			})?;
 
 			let Some(chunk) = chunk_opt else {
+				debug!(
+					"[CHUNK_TRANSFER] Finished receiving chunks from node {} (received {})",
+					srcnode.id, chunks_received
+				);
 				break; // No more chunks
 			};
 
+			chunks_received += 1;
 			let hash_str = &chunk.hash;
 			let chunk_data = chunk.data;
 			let chunk_size = chunk_data.len() as u64;
+			debug!(
+				"[CHUNK_TRANSFER] Received chunk {} from node {} (size: {} bytes)",
+				hash_str, srcnode.id, chunk_size
+			);
 
 			// Send chunk to nodes that need it
 			for (dst_idx, dstnode) in state.nodes.iter().enumerate() {
 				if dst_idx != src_idx {
 					let mut missing = dstnode.missing.lock().await;
 					if missing.contains(hash_str) {
+						debug!(
+							"[CHUNK_TRANSFER] Sending chunk {} to node {} ({})",
+							hash_str, dstnode.id, dst_idx
+						);
 						dstnode
 							.protocol
 							.lock()
 							.await
 							.send_chunk(hash_str, &chunk_data)
 							.await
-							.map_err(|e| Box::new(e) as Box<dyn Error>)?;
+							.map_err(|e| {
+								error!(
+									"[CHUNK_TRANSFER] Failed to send chunk {} to node {}: {}",
+									hash_str, dstnode.id, e
+								);
+								Box::new(e) as Box<dyn Error>
+							})?;
 
 						missing.remove(hash_str);
 						// Track bytes sent from source to destination node
@@ -1318,6 +1592,54 @@ async fn run_sync_logic(
 		});
 	}
 	let total_nodes = state.nodes.len();
+
+	// CRITICAL: Pre-commit verification - verify all chunks received before committing
+	// This prevents data corruption if chunks didn't fully transfer
+	debug!("Verifying all chunks received before commit...");
+	for node in &state.nodes {
+		let missing = node.missing.lock().await;
+		if !missing.is_empty() {
+			// Find which files would be corrupted by missing chunks
+			let mut affected_files = Vec::new();
+			'file_loop: for (path, file_data) in &node.dir {
+				for chunk in &file_data.chunks {
+					let hash_b64 = crate::util::hash_to_base64(&chunk.hash);
+					if missing.contains(&hash_b64) {
+						affected_files.push(path.clone());
+						break 'file_loop;
+					}
+				}
+			}
+
+			// Create detailed error message
+			let affected_list = affected_files
+				.iter()
+				.take(10)
+				.map(|p| format!("  - {}", p.display()))
+				.collect::<Vec<_>>()
+				.join("\n");
+
+			let missing_list = missing
+				.iter()
+				.take(5)
+				.map(|h| format!("  - {}", h))
+				.collect::<Vec<_>>()
+				.join("\n");
+
+			let error_msg = format!(
+				"CRITICAL: Node {} has {} unreceived chunks. Cannot commit - would corrupt files:\n{}\n\
+				 Missing chunks (showing first 5):\n{}",
+				node.id,
+				missing.len(),
+				affected_list,
+				missing_list
+			);
+
+			error!("{}", error_msg);
+			return Err(error_msg.into());
+		}
+	}
+
 	for (nodes_committed, node) in state.nodes.iter().enumerate() {
 		let commit_response = node
 			.protocol
