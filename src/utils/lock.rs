@@ -10,6 +10,17 @@ use tracing::{debug, warn};
 /// Shared shutdown flag for signal handlers
 pub static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
+/// Check if shutdown was requested and return an error if so
+/// Useful for breaking out of long operations when SIGTERM is received
+pub fn check_shutdown() -> Result<(), &'static str> {
+	if SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
+		debug!("Shutdown requested, aborting operation");
+		Err("Shutdown requested")
+	} else {
+		Ok(())
+	}
+}
+
 /// Setup signal handlers for graceful cleanup on termination
 /// With path-level locking in the cache DB, locks are automatically
 /// released when the process exits.

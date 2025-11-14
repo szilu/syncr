@@ -143,6 +143,12 @@ pub struct ChildCache {
 impl ChildCache {
 	/// Open or create a child cache database
 	pub fn open(db_path: &path::Path) -> Result<Self, Box<dyn Error>> {
+		// Check if shutdown was requested before attempting to open database
+		use crate::utils::lock::SHUTDOWN_REQUESTED;
+		if SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
+			return Err("Shutdown requested, aborting cache open".into());
+		}
+
 		let db = redb::Database::create(db_path)?;
 		let db = Arc::new(db);
 		// Ensure both tables exist

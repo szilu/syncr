@@ -82,7 +82,13 @@ impl NodeState {
 		}
 
 		// Receive entries
+		use crate::utils::check_shutdown;
 		loop {
+			// Check for shutdown request during collection
+			check_shutdown().map_err(|e| {
+				Box::new(std::io::Error::new(std::io::ErrorKind::Interrupted, e)) as Box<dyn Error>
+			})?;
+
 			let entry_opt = {
 				let mut protocol = self.protocol.lock().await;
 				protocol.receive_entry().await.map_err(|e| Box::new(e) as Box<dyn Error>)?

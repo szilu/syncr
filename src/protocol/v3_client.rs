@@ -136,17 +136,21 @@ impl ProtocolClient for ProtocolV3 {
 	}
 
 	async fn request_capabilities(&mut self) -> ProtocolResult<NodeCapabilities> {
-		let mut sender = self.send.lock().await;
-		sender.write_all(b"{\"cmd\":\"CAP\"}\n").await?;
-		sender.flush().await?;
+		{
+			let mut sender = self.send.lock().await;
+			sender.write_all(b"{\"cmd\":\"CAP\"}\n").await?;
+			sender.flush().await?;
+		} // Release sender lock before reading response
 
 		// Wait for the response
 		let mut buf = String::new();
-		let mut receiver = self.recv.lock().await;
 
 		loop {
 			buf.clear();
-			receiver.read_line(&mut buf).await?;
+			{
+				let mut receiver = self.recv.lock().await;
+				receiver.read_line(&mut buf).await?;
+			}
 
 			let trimmed = buf.trim();
 
@@ -185,16 +189,18 @@ impl ProtocolClient for ProtocolV3 {
 
 	async fn receive_entry(&mut self) -> ProtocolResult<Option<FileSystemEntry>> {
 		let mut buf = String::new();
-		let mut receiver = self.recv.lock().await;
 
 		loop {
-			// Use buffered line if available, otherwise read a new line
+			// Read one line at a time, releasing the lock between lines
 			let trimmed = if let Some(buffered) = self.buffered_entry_line.take() {
 				buf = buffered;
 				buf.trim()
 			} else {
 				buf.clear();
-				receiver.read_line(&mut buf).await?;
+				{
+					let mut receiver = self.recv.lock().await;
+					receiver.read_line(&mut buf).await?;
+				}
 				buf.trim()
 			};
 
@@ -244,7 +250,10 @@ impl ProtocolClient for ProtocolV3 {
 							// Read subsequent chunks for this file
 							loop {
 								buf.clear();
-								receiver.read_line(&mut buf).await?;
+								{
+									let mut receiver = self.recv.lock().await;
+									receiver.read_line(&mut buf).await?;
+								}
 								let chunk_trimmed = buf.trim();
 
 								// Check for end of listing
@@ -521,16 +530,24 @@ impl ProtocolClient for ProtocolV3 {
 
 	async fn receive_chunk(&mut self) -> ProtocolResult<Option<ChunkData>> {
 		let mut buf = String::new();
-		let mut receiver = self.recv.lock().await;
 		let mut line_count = 0u32;
 
 		loop {
+			// Read one line at a time, releasing the lock between lines
 			buf.clear();
 			line_count += 1;
-			receiver.read_line(&mut buf).await.map_err(|e| {
-				tracing::error!("[v3_client] Failed to read line (attempt {}): {}", line_count, e);
-				ProtocolError::Io(e)
-			})?;
+
+			{
+				let mut receiver = self.recv.lock().await;
+				receiver.read_line(&mut buf).await.map_err(|e| {
+					tracing::error!(
+						"[v3_client] Failed to read line (attempt {}): {}",
+						line_count,
+						e
+					);
+					ProtocolError::Io(e)
+				})?;
+			}
 
 			let trimmed = buf.trim();
 
@@ -570,20 +587,23 @@ impl ProtocolClient for ProtocolV3 {
 							// Read binary chunk data
 							let mut bytes_read = 0;
 							while bytes_read < chunk_len {
-								match receiver.read(&mut chunk_data[bytes_read..]).await {
-									Ok(n) => {
-										if n == 0 {
-											return Err(ProtocolError::ProtocolViolation(
-												format!("Unexpected EOF while reading chunk {} (got {}/{} bytes)",
-													hash_str, bytes_read, chunk_len)
-											));
+								let n = {
+									let mut receiver = self.recv.lock().await;
+									match receiver.read(&mut chunk_data[bytes_read..]).await {
+										Ok(n) => n,
+										Err(e) => {
+											return Err(ProtocolError::Io(e));
 										}
-										bytes_read += n;
 									}
-									Err(e) => {
-										return Err(ProtocolError::Io(e));
-									}
+								};
+
+								if n == 0 {
+									return Err(ProtocolError::ProtocolViolation(format!(
+										"Unexpected EOF while reading chunk {} (got {}/{} bytes)",
+										hash_str, bytes_read, chunk_len
+									)));
 								}
+								bytes_read += n;
 							}
 							tracing::debug!(
 								"[v3_client] Successfully read {} bytes for chunk {}",
@@ -592,19 +612,30 @@ impl ProtocolClient for ProtocolV3 {
 							);
 
 							// Read the trailing newline
-							let mut trailing = [0u8; 1];
-							match receiver.read(&mut trailing).await {
-								Ok(n) => {
-									if n == 0 || trailing[0] != b'\n' {
-										return Err(ProtocolError::ProtocolViolation(format!(
-											"Expected newline after chunk {} data, got: {:?}",
-											hash_str, trailing
-										)));
+							let trailing_byte = {
+								let mut receiver = self.recv.lock().await;
+								let mut trailing = [0u8; 1];
+								match receiver.read(&mut trailing).await {
+									Ok(n) => {
+										if n == 0 {
+											return Err(ProtocolError::ProtocolViolation(format!(
+												"Expected newline after chunk {} data, got EOF",
+												hash_str
+											)));
+										}
+										trailing[0]
+									}
+									Err(e) => {
+										return Err(ProtocolError::Io(e));
 									}
 								}
-								Err(e) => {
-									return Err(ProtocolError::Io(e));
-								}
+							};
+
+							if trailing_byte != b'\n' {
+								return Err(ProtocolError::ProtocolViolation(format!(
+									"Expected newline after chunk {} data, got: {:?}",
+									hash_str, trailing_byte
+								)));
 							}
 
 							tracing::debug!(

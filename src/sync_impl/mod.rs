@@ -444,8 +444,15 @@ async fn run_sync_logic(
 	conflict_rx: Option<std::sync::mpsc::Receiver<ConflictResolution>>,
 	metrics: &mut SyncMetrics,
 ) -> Result<(), Box<dyn Error>> {
+	use crate::utils::check_shutdown;
+
 	//let mut tree: BTreeMap<path::PathBuf, u8> = BTreeMap::new();
 	let mut tree: BTreeMap<path::PathBuf, Box<FileData>> = BTreeMap::new();
+
+	// Check for shutdown at the start
+	check_shutdown().map_err(|e| {
+		Box::new(std::io::Error::new(std::io::ErrorKind::Interrupted, e)) as Box<dyn Error>
+	})?;
 
 	// Load previous sync state for three-way merge detection
 	info!("Loading previous state...");
@@ -471,6 +478,11 @@ async fn run_sync_logic(
 	let mut connection_capabilities: Vec<Vec<u32>> = Vec::new();
 
 	for (idx, dir) in dirs.iter().enumerate() {
+		// Check for shutdown between connections
+		check_shutdown().map_err(|e| {
+			Box::new(std::io::Error::new(std::io::ErrorKind::Interrupted, e)) as Box<dyn Error>
+		})?;
+
 		// Notify that we're connecting
 		if let Some(ref cb) = callbacks {
 			cb.on_event(SyncCallbackEvent::NodeConnecting {
@@ -532,6 +544,10 @@ async fn run_sync_logic(
 	}
 
 	// ─── PHASE 2: Version Decision ───
+	check_shutdown().map_err(|e| {
+		Box::new(std::io::Error::new(std::io::ErrorKind::Interrupted, e)) as Box<dyn Error>
+	})?;
+
 	let common_version = crate::protocol::factory::find_common_version(&connection_capabilities)?;
 	info!("Selected common protocol version: {}", common_version);
 
@@ -541,6 +557,11 @@ async fn run_sync_logic(
 
 	// ─── PHASE 3: Version Distribution & Protocol Finalization ───
 	for protocol_state in protocol_states.into_iter() {
+		// Check for shutdown between protocol finalization
+		check_shutdown().map_err(|e| {
+			Box::new(std::io::Error::new(std::io::ErrorKind::Interrupted, e)) as Box<dyn Error>
+		})?;
+
 		match protocol_state {
 			ProtocolState::Remote(idx, waiting) => {
 				// Remote connections need to finalize the version decision
@@ -589,6 +610,9 @@ async fn run_sync_logic(
 	}
 
 	info!("Collecting...");
+	check_shutdown().map_err(|e| {
+		Box::new(std::io::Error::new(std::io::ErrorKind::Interrupted, e)) as Box<dyn Error>
+	})?;
 
 	// Collect from all nodes in parallel to speed up collection
 	// Each node sends progress updates during collection
