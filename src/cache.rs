@@ -136,6 +136,7 @@ impl Drop for PathLockGuard {
 }
 
 /// Child cache backed by redb database
+#[derive(Clone)]
 pub struct ChildCache {
 	pub(crate) db: Arc<redb::Database>,
 }

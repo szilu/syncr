@@ -201,10 +201,6 @@ impl ProtocolClient for ProtocolInternalClient {
 		}
 	}
 
-	fn has_chunk(&self, hash: &[u8; 32]) -> bool {
-		self.chunks.contains(hash)
-	}
-
 	fn mark_chunk_missing(&self, hash: String) {
 		let missing = self.missing.clone();
 		tokio::spawn(async move {

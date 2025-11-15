@@ -106,103 +106,139 @@ impl ProtocolV3Server {
 						}
 
 						"LIST" => {
-							// Request directory listing
-							match self.handle_list().await {
-								Ok(entries) => {
-									for entry in entries {
-										// Output file/dir/symlink metadata
-										match serialize_entry_json5(&entry) {
-											Ok(json_str) => {
-												if let Err(e) =
-													writer.write_all(json_str.as_bytes()).await
-												{
-													let _ = send_error_response(
-														&mut writer,
-														&format!("Write error: {}", e),
-													)
-													.await;
-													break;
-												}
-												if let Err(e) = writer.write_all(b"\n").await {
-													let _ = send_error_response(
-														&mut writer,
-														&format!("Write error: {}", e),
-													)
-													.await;
-													break;
-												}
+							// Request directory listing with streaming
+							// Entries arrive as they're discovered, not after full scan
+							match self.handle_list_streaming().await {
+								Ok(mut receiver) => {
+									let mut had_error = false;
 
-												// Output chunks for this entry
-												for chunk in &entry.chunks {
-													let chunk_json = serde_json::json!({
-														"typ": "C",
-														"off": chunk.offset,
-														"len": chunk.size,
-														"hsh": util::hash_to_base64(&chunk.hash),
-													});
-													match serde_json::to_string(&chunk_json) {
-														Ok(chunk_str) => {
-															if let Err(e) = writer
-																.write_all(chunk_str.as_bytes())
-																.await
-															{
-																let _ = send_error_response(
-																	&mut writer,
-																	&format!("Write error: {}", e),
-																)
-																.await;
-																break;
-															}
-															if let Err(e) =
-																writer.write_all(b"\n").await
-															{
-																let _ = send_error_response(
-																	&mut writer,
-																	&format!("Write error: {}", e),
-																)
-																.await;
-																break;
-															}
-														}
-														Err(e) => {
+									// Process entries as they arrive from the streaming channel
+									while let Some(entry_result) = receiver.recv().await {
+										match entry_result {
+											Ok(entry) => {
+												// Output file/dir/symlink metadata
+												match serialize_entry_json5(&entry) {
+													Ok(json_str) => {
+														if let Err(e) = writer
+															.write_all(json_str.as_bytes())
+															.await
+														{
 															let _ = send_error_response(
 																&mut writer,
-																&format!(
-																	"Serialization error: {}",
-																	e
-																),
+																&format!("Write error: {}", e),
 															)
 															.await;
+															had_error = true;
 															break;
 														}
+														if let Err(e) =
+															writer.write_all(b"\n").await
+														{
+															let _ = send_error_response(
+																&mut writer,
+																&format!("Write error: {}", e),
+															)
+															.await;
+															had_error = true;
+															break;
+														}
+
+														// Output chunks for this entry
+														for chunk in &entry.chunks {
+															let chunk_json = serde_json::json!({
+																"typ": "C",
+																"off": chunk.offset,
+																"len": chunk.size,
+																"hsh": util::hash_to_base64(&chunk.hash),
+															});
+															match serde_json::to_string(&chunk_json)
+															{
+																Ok(chunk_str) => {
+																	if let Err(e) = writer
+																		.write_all(
+																			chunk_str.as_bytes(),
+																		)
+																		.await
+																	{
+																		let _ = send_error_response(
+																			&mut writer,
+																			&format!("Write error: {}", e),
+																		)
+																		.await;
+																		had_error = true;
+																		break;
+																	}
+																	if let Err(e) = writer
+																		.write_all(b"\n")
+																		.await
+																	{
+																		let _ = send_error_response(
+																			&mut writer,
+																			&format!("Write error: {}", e),
+																		)
+																		.await;
+																		had_error = true;
+																		break;
+																	}
+																}
+																Err(e) => {
+																	let _ = send_error_response(
+																		&mut writer,
+																		&format!(
+																			"Serialization error: {}",
+																			e
+																		),
+																	)
+																	.await;
+																	had_error = true;
+																	break;
+																}
+															}
+														}
+													}
+													Err(e) => {
+														let _ = send_error_response(
+															&mut writer,
+															&format!("Serialization error: {}", e),
+														)
+														.await;
+														had_error = true;
+														break;
 													}
 												}
 											}
 											Err(e) => {
+												// Log error from listing, continue to next entry
 												let _ = send_error_response(
 													&mut writer,
-													&format!("Serialization error: {}", e),
+													&format!("Listing error: {}", e),
 												)
 												.await;
-												break;
+												// Continue processing remaining entries
 											}
 										}
 									}
-									if let Err(e) = writer.write_all(b"{\"cmd\":\"END\"}\n").await {
-										let _ = send_error_response(
-											&mut writer,
-											&format!("Write error: {}", e),
-										)
-										.await;
-										break;
-									}
-									if let Err(e) = writer.flush().await {
-										let _ = send_error_response(
-											&mut writer,
-											&format!("Flush error: {}", e),
-										)
-										.await;
-										break;
+
+									// Send END marker only if no fatal error
+									if !had_error {
+										if let Err(e) =
+											writer.write_all(b"{\"cmd\":\"END\"}\n").await
+										{
+											let _ = send_error_response(
+												&mut writer,
+												&format!("Write error: {}", e),
+											)
+											.await;
+											break;
+										}
+										if let Err(e) = writer.flush().await {
+											let _ = send_error_response(
+												&mut writer,
+												&format!("Flush error: {}", e),
+											)
+											.await;
+											break;
+										}
 									}
 								}
 								Err(e) => {
@@ -745,6 +781,13 @@ impl ProtocolServer for ProtocolV3Server {
 		self.fs_server.list_directory().await
 	}
 
+	async fn handle_list_streaming(
+		&mut self,
+	) -> ProtocolResult<tokio::sync::mpsc::Receiver<ProtocolResult<FileSystemEntry>>> {
+		// Override default to use streaming implementation instead of blocking list_directory()
+		self.fs_server.list_directory_streaming()
+	}
+
 	async fn handle_write_metadata(&mut self, entry: &MetadataEntry) -> ProtocolResult<()> {
 		self.fs_server.write_metadata(entry).await
 	}
@@ -787,10 +830,6 @@ impl ProtocolServer for ProtocolV3Server {
 
 	async fn handle_commit(&mut self) -> ProtocolResult<CommitResponse> {
 		self.fs_server.commit().await
-	}
-
-	fn has_chunk(&self, hash: &[u8; 32]) -> bool {
-		self.fs_server.has_chunk(hash)
 	}
 }
 

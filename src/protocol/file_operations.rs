@@ -8,11 +8,14 @@ use rollsum::Bup;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::fs as afs;
 use tokio::io::AsyncReadExt;
+use tokio::sync::Semaphore;
 use tracing::{debug, error, warn};
 
 use super::error::ProtocolError;
+use super::streaming::{create_listing_channel, ListingStream, StreamingConfig};
 use super::types::*;
 use crate::chunking;
 use crate::serve::DumpState;
@@ -39,6 +42,46 @@ impl FileSystemServer {
 		let base = self.base_path.clone();
 		self.traverse_dir_for_listing_impl(&base, &mut entries).await?;
 		Ok(entries)
+	}
+
+	/// List all files/directories recursively via streaming
+	///
+	/// This method returns a channel that yields entries as they're discovered.
+	/// This enables:
+	/// - Lower initial latency (first entry arrives sooner)
+	/// - Lower memory usage (no buffering all entries)
+	/// - Concurrency control via semaphore (Phase 2+)
+	pub fn list_directory_streaming(&self) -> Result<ListingStream, ProtocolError> {
+		// Create channel with default buffer size
+		let config = StreamingConfig::default();
+		let (sender, receiver) = create_listing_channel(&config);
+
+		// Clone state for the task
+		let state = self.state.clone();
+		let base_path = self.base_path.clone();
+		let exclude_patterns = self.state.exclude.clone();
+
+		// Create semaphore to limit concurrent file operations
+		// This prevents "too many open files" errors by limiting concurrent chunk computations
+		let semaphore = Arc::new(Semaphore::new(config.max_concurrent_files));
+
+		// Spawn task to traverse directory and send entries
+		// IMPORTANT: This must run to completion before returning so all chunks are in DumpState
+		// The sender will block when buffer is full, providing backpressure
+		tokio::spawn(async move {
+			debug!(
+				"Starting directory traversal task with semaphore limit: {}",
+				config.max_concurrent_files
+			);
+			if let Err(e) =
+				traverse_and_stream(base_path, state, exclude_patterns, sender, semaphore).await
+			{
+				error!("Directory traversal failed: {}", e);
+			}
+			debug!("Directory traversal task completed");
+		});
+
+		Ok(receiver)
 	}
 
 	/// Helper for recursive directory traversal (helper that does the work)
@@ -181,9 +224,9 @@ impl FileSystemServer {
 			let hash_binary = util::hash_binary(&buf[..count]);
 			chunks.push(ChunkInfo { hash: hash_binary, offset, size: count as u32 });
 
-			// Track chunk in state for later retrieval
+			// Track chunk in state for later retrieval (thread-safe)
 			let hash_b64 = util::hash_to_base64(&hash_binary);
-			self.state.add_chunk(hash_b64, path.to_path_buf(), offset, count);
+			self.state.add_chunk(hash_b64, path.to_path_buf(), offset, count).await;
 
 			// Shift remaining data to front
 			buf.copy_within(count..n, 0);
@@ -490,13 +533,258 @@ impl FileSystemServer {
 			failed_count: Some(failed_count),
 		})
 	}
+}
 
-	/// Check if a chunk exists locally
-	#[allow(dead_code)]
-	pub fn has_chunk(&self, hash: &[u8; 32]) -> bool {
-		let hash_b64 = crate::util::hash_to_base64(hash);
-		self.state.chunks.contains_key(&hash_b64)
+/// Traverses directory tree and streams entries through a channel
+///
+/// This function is spawned as a separate task by list_directory_streaming.
+/// It walks the directory, computes chunks for each file, and sends entries
+/// to the caller as they're discovered. When the channel is closed (receiver
+/// dropped), the task gracefully terminates.
+async fn traverse_and_stream(
+	base_path: PathBuf,
+	state: DumpState,
+	exclude_patterns: Vec<glob::Pattern>,
+	sender: super::streaming::ListingSender,
+	semaphore: Arc<Semaphore>,
+) -> Result<(), ProtocolError> {
+	let mut stack = vec![base_path.clone()];
+
+	while let Some(dir) = stack.pop() {
+		let read_result = fs::read_dir(&dir);
+		let dir_entries = match read_result {
+			Ok(e) => e,
+			Err(e) => {
+				warn!("Cannot read directory {}: {}", dir.display(), e);
+				continue;
+			}
+		};
+
+		for entry_result in dir_entries {
+			let entry = match entry_result {
+				Ok(e) => e,
+				Err(e) => {
+					debug!("Error reading directory entry: {}", e);
+					continue;
+				}
+			};
+
+			let path = entry.path();
+
+			// Skip excluded files
+			if exclude_patterns.iter().any(|p| p.matches_path(&path)) {
+				continue;
+			}
+
+			let meta = match fs::symlink_metadata(&path) {
+				Ok(m) => m,
+				Err(e) => {
+					warn!("Cannot access {}: {}", path.display(), e);
+					continue;
+				}
+			};
+
+			let relative_path = path.strip_prefix(&base_path).unwrap_or(&path).to_path_buf();
+
+			// Prepare entry based on type
+			let entry_result = if meta.is_file() {
+				// Acquire semaphore permit BEFORE computing chunks
+				// This prevents "too many open files" errors by limiting concurrent file operations
+				let file_path = path.clone();
+				let state_clone = state.clone();
+
+				// Acquire permit - this will block if we've hit the concurrency limit
+				// This provides natural backpressure: if we're maxed out on concurrent files,
+				// directory traversal pauses until a file is done processing
+				match semaphore.acquire().await {
+					Ok(permit) => {
+						// Compute chunks while holding the permit
+						match compute_file_chunks(&file_path, &state_clone).await {
+							Ok(chunks) => {
+								// Permit will be released when it goes out of scope
+								drop(permit);
+
+								// Send entry with chunks already computed
+								Ok(FileSystemEntry {
+									entry_type: FileSystemEntryType::File,
+									path: relative_path,
+									mode: meta.mode(),
+									user_id: meta.uid(),
+									group_id: meta.gid(),
+									created_time: meta.ctime() as u32,
+									modified_time: meta.mtime() as u32,
+									size: meta.size(),
+									target: None,
+									needs_data_transfer: None,
+									chunks,
+								})
+							}
+							Err(e) => {
+								drop(permit);
+								warn!(
+									"Failed to compute chunks for {}: {}",
+									file_path.display(),
+									e
+								);
+								// Send entry with empty chunks on error
+								Ok(FileSystemEntry {
+									entry_type: FileSystemEntryType::File,
+									path: relative_path,
+									mode: meta.mode(),
+									user_id: meta.uid(),
+									group_id: meta.gid(),
+									created_time: meta.ctime() as u32,
+									modified_time: meta.mtime() as u32,
+									size: meta.size(),
+									target: None,
+									needs_data_transfer: None,
+									chunks: Vec::new(),
+								})
+							}
+						}
+					}
+					Err(e) => {
+						error!("Failed to acquire semaphore permit: {}", e);
+						// Send entry with empty chunks if we can't get permit
+						Ok(FileSystemEntry {
+							entry_type: FileSystemEntryType::File,
+							path: relative_path,
+							mode: meta.mode(),
+							user_id: meta.uid(),
+							group_id: meta.gid(),
+							created_time: meta.ctime() as u32,
+							modified_time: meta.mtime() as u32,
+							size: meta.size(),
+							target: None,
+							needs_data_transfer: None,
+							chunks: Vec::new(),
+						})
+					}
+				}
+			} else if meta.is_symlink() {
+				// Process symlink
+				let target = fs::read_link(&path).ok();
+
+				Ok(FileSystemEntry {
+					entry_type: FileSystemEntryType::SymLink,
+					path: relative_path,
+					mode: meta.mode(),
+					user_id: meta.uid(),
+					group_id: meta.gid(),
+					created_time: meta.ctime() as u32,
+					modified_time: meta.mtime() as u32,
+					size: 0,
+					target,
+					chunks: Vec::new(),
+					needs_data_transfer: None,
+				})
+			} else if meta.is_dir() {
+				// Add directory entry
+				let fse = FileSystemEntry {
+					entry_type: FileSystemEntryType::Directory,
+					path: relative_path,
+					mode: meta.mode(),
+					user_id: meta.uid(),
+					group_id: meta.gid(),
+					created_time: meta.ctime() as u32,
+					modified_time: meta.mtime() as u32,
+					size: 0,
+					target: None,
+					needs_data_transfer: None,
+					chunks: Vec::new(),
+				};
+
+				// Push to stack for recursive processing
+				stack.push(path);
+
+				Ok(fse)
+			} else {
+				continue;
+			};
+
+			// Send entry through channel
+			// If receiver is dropped, exit gracefully
+			if sender.send(entry_result).await.is_err() {
+				debug!("Receiver dropped, terminating directory stream");
+				return Ok(());
+			}
+		}
 	}
+
+	Ok(())
+}
+
+/// Compute chunks for a file using rolling hash
+///
+/// This is extracted from get_file_chunks() to be reusable by both
+/// the blocking and streaming paths.
+async fn compute_file_chunks(
+	path: &Path,
+	state: &DumpState,
+) -> Result<Vec<ChunkInfo>, ProtocolError> {
+	let mut chunks = Vec::new();
+
+	let mut f = match afs::File::open(&path).await {
+		Ok(file) => file,
+		Err(e) => {
+			warn!("Cannot open file {}: {}", path.display(), e);
+			return Ok(Vec::new());
+		}
+	};
+
+	debug!("[compute_file_chunks] Processing: {}", path.display());
+
+	let mut buf: Vec<u8> = vec![0; chunking::MAX_CHUNK_SIZE];
+	let mut n = match f.read(&mut buf).await {
+		Ok(bytes) => bytes,
+		Err(e) => {
+			warn!("Cannot read file {}: {}", path.display(), e);
+			return Ok(Vec::new());
+		}
+	};
+
+	let mut offset: u64 = 0;
+	while n > 0 {
+		let mut bup = Bup::new_with_chunk_bits(chunking::CHUNK_BITS);
+		let mut endofs = chunking::MAX_CHUNK_SIZE;
+		if endofs > n {
+			endofs = n;
+		}
+
+		let count =
+			if let Some((edge, _)) = bup.find_chunk_edge(&buf[..endofs]) { edge } else { endofs };
+
+		let hash_binary = util::hash_binary(&buf[..count]);
+		chunks.push(ChunkInfo { hash: hash_binary, offset, size: count as u32 });
+
+		// Track chunk in state for later retrieval (thread-safe)
+		let hash_b64 = util::hash_to_base64(&hash_binary);
+		state.add_chunk(hash_b64.clone(), path.to_path_buf(), offset, count).await;
+		debug!(
+			"[compute_file_chunks] Added chunk: {} ({}B @ offset {})",
+			&hash_b64[..8],
+			count,
+			offset
+		);
+
+		// Shift remaining data to front
+		buf.copy_within(count..n, 0);
+		offset += count as u64;
+		n -= count;
+
+		// Read next chunk of file
+		let read_result = f.read(&mut buf[n..]).await;
+		match read_result {
+			Ok(bytes) => n += bytes,
+			Err(e) => {
+				warn!("Error reading file {}: {}", path.display(), e);
+				break;
+			}
+		}
+	}
+
+	debug!("[compute_file_chunks] Completed {}: {} chunks", path.display(), chunks.len());
+	Ok(chunks)
 }
 
 // vim: ts=4

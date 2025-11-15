@@ -34,6 +34,7 @@ pub mod internal_client;
 pub mod internal_server;
 pub mod messages;
 pub mod negotiation;
+pub mod streaming;
 pub mod traits;
 pub mod types;
 pub mod v3_client;

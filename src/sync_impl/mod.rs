@@ -1621,6 +1621,7 @@ async fn run_sync_logic(
 	// This prevents data corruption if chunks didn't fully transfer
 	debug!("Verifying all chunks received before commit...");
 	for node in &state.nodes {
+		// Check for non-empty files with missing chunks
 		let missing = node.missing.lock().await;
 		if !missing.is_empty() {
 			// Find which files would be corrupted by missing chunks
@@ -1661,6 +1662,26 @@ async fn run_sync_logic(
 
 			error!("{}", error_msg);
 			return Err(error_msg.into());
+		}
+
+		// CRITICAL: Validate that non-empty files have chunks
+		// This catches streaming failures or collection issues
+		for (path, file_data) in &node.dir {
+			// Only check regular files (dirs and symlinks are OK with no chunks)
+			if file_data.tp == crate::types::FileType::File
+				&& file_data.size > 0
+				&& file_data.chunks.is_empty()
+			{
+				let error_msg = format!(
+					"CRITICAL: Node {} - File {} has size {} bytes but NO chunks! \
+					 This indicates a streaming/collection failure. Cannot commit - would lose data.",
+					node.id,
+					path.display(),
+					file_data.size
+				);
+				error!("{}", error_msg);
+				return Err(error_msg.into());
+			}
 		}
 	}
 

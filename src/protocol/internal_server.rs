@@ -45,10 +45,23 @@ impl ProtocolInternalServer {
 					}
 				},
 
-				ProtocolCommand::List => match self.handle_list().await {
-					Ok(entries) => {
-						for entry in entries {
-							let _ = self.response_tx.send(ProtocolResponse::Entry(entry)).await;
+				ProtocolCommand::List => match self.handle_list_streaming().await {
+					Ok(mut receiver) => {
+						// Process entries as they arrive from the streaming channel
+						while let Some(entry_result) = receiver.recv().await {
+							match entry_result {
+								Ok(entry) => {
+									let _ =
+										self.response_tx.send(ProtocolResponse::Entry(entry)).await;
+								}
+								Err(e) => {
+									let _ = self
+										.response_tx
+										.send(ProtocolResponse::Error(e.to_string()))
+										.await;
+									break;
+								}
+							}
 						}
 						let _ = self.response_tx.send(ProtocolResponse::EndOfList).await;
 					}
@@ -156,6 +169,13 @@ impl ProtocolServer for ProtocolInternalServer {
 		self.fs_server.list_directory().await
 	}
 
+	async fn handle_list_streaming(
+		&mut self,
+	) -> ProtocolResult<tokio::sync::mpsc::Receiver<ProtocolResult<FileSystemEntry>>> {
+		// Override default to use streaming implementation instead of blocking list_directory()
+		self.fs_server.list_directory_streaming()
+	}
+
 	async fn handle_write_metadata(&mut self, entry: &MetadataEntry) -> ProtocolResult<()> {
 		use tracing::debug;
 		debug!(
@@ -180,10 +200,6 @@ impl ProtocolServer for ProtocolInternalServer {
 
 	async fn handle_commit(&mut self) -> ProtocolResult<CommitResponse> {
 		self.fs_server.commit().await
-	}
-
-	fn has_chunk(&self, hash: &[u8; 32]) -> bool {
-		self.fs_server.has_chunk(hash)
 	}
 }
 

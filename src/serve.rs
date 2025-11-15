@@ -14,9 +14,11 @@ use crate::util;
 //////////
 // List //
 //////////
+#[derive(Clone)]
 pub struct DumpState {
 	pub exclude: Vec<glob::Pattern>,
-	pub chunks: BTreeMap<String, Vec<FileChunk>>,
+	/// Thread-safe chunk tracking for concurrent access during parallel file processing
+	pub chunks: Arc<Mutex<BTreeMap<String, Vec<FileChunk>>>>,
 	#[allow(dead_code)]
 	pub missing: Arc<Mutex<BTreeMap<String, Vec<FileChunk>>>>,
 	pub rename: Arc<Mutex<BTreeMap<path::PathBuf, path::PathBuf>>>,
@@ -27,8 +29,13 @@ pub struct DumpState {
 }
 
 impl DumpState {
-	pub fn add_chunk(&mut self, hash: String, path: path::PathBuf, offset: u64, size: usize) {
-		let v = self.chunks.entry(hash).or_default();
+	/// Add a chunk to the shared state (thread-safe)
+	///
+	/// This method acquires a lock on the chunks map and adds or updates the chunk entry.
+	/// It's now async to support the Mutex-based synchronization.
+	pub async fn add_chunk(&self, hash: String, path: path::PathBuf, offset: u64, size: usize) {
+		let mut chunks_guard = self.chunks.lock().await;
+		let v = chunks_guard.entry(hash).or_default();
 		if !v.iter().any(|p| p.path == path) {
 			v.push(FileChunk { path, offset, size });
 		}
@@ -39,7 +46,9 @@ impl DumpState {
 		dir: &path::Path,
 		hash: &str,
 	) -> Result<Option<Vec<u8>>, Box<dyn Error>> {
-		let fc_vec_opt = self.chunks.get(hash);
+		// Acquire lock to access chunks
+		let chunks_guard = self.chunks.lock().await;
+		let fc_vec_opt = chunks_guard.get(hash);
 
 		match fc_vec_opt {
 			Some(fc_vec) => {
@@ -253,7 +262,7 @@ pub async fn serve(dir: &str) -> Result<(), Box<dyn Error>> {
 	let base_path = path::PathBuf::from(".");
 	let dump_state = DumpState {
 		exclude: vec![glob::Pattern::new("**/*.SyNcR-TmP")?],
-		chunks: BTreeMap::new(),
+		chunks: Arc::new(Mutex::new(BTreeMap::new())),
 		missing: Arc::new(Mutex::new(BTreeMap::new())),
 		rename: Arc::new(Mutex::new(BTreeMap::new())),
 		chunk_writes: Arc::new(Mutex::new(BTreeMap::new())),

@@ -90,9 +90,6 @@ pub trait ProtocolClient: Send + Sync {
 
 	// === Utility Methods ===
 
-	/// Check if a chunk is available locally (on the client/orchestrator side)
-	fn has_chunk(&self, hash: &[u8; 32]) -> bool;
-
 	/// Mark chunks as missing (need transfer)
 	fn mark_chunk_missing(&self, hash: String);
 
@@ -129,6 +126,27 @@ pub trait ProtocolServer {
 	/// Handle listing request - returns all entries
 	async fn handle_list(&mut self) -> ProtocolResult<Vec<FileSystemEntry>>;
 
+	/// Handle listing request via streaming - yields entries as discovered
+	///
+	/// This method allows streaming entries as they're discovered without
+	/// buffering the entire directory tree in memory.
+	///
+	/// The default implementation uses list_directory() and buffers results
+	/// in a channel for backwards compatibility.
+	///
+	/// Returns a receiver channel that yields FileSystemEntry objects.
+	async fn handle_list_streaming(
+		&mut self,
+	) -> ProtocolResult<tokio::sync::mpsc::Receiver<ProtocolResult<FileSystemEntry>>> {
+		// Default: use old list_directory() and buffer results in a channel
+		let entries = self.handle_list().await?;
+		let (tx, rx) = tokio::sync::mpsc::channel(entries.len().max(1));
+		for entry in entries {
+			let _ = tx.send(Ok(entry)).await;
+		}
+		Ok(rx)
+	}
+
 	/// Handle metadata write - processes incoming metadata entry
 	async fn handle_write_metadata(&mut self, entry: &MetadataEntry) -> ProtocolResult<()>;
 
@@ -143,10 +161,6 @@ pub trait ProtocolServer {
 
 	/// Handle commit - rename temp files to final locations
 	async fn handle_commit(&mut self) -> ProtocolResult<CommitResponse>;
-
-	/// Check if a chunk is available
-	#[allow(dead_code)]
-	fn has_chunk(&self, hash: &[u8; 32]) -> bool;
 }
 
 #[cfg(test)]
